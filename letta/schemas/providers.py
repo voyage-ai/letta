@@ -850,14 +850,17 @@ class VoyageAIProvider(Provider):
             ("voyage-law-2", 1024, 7),
             ("voyage-code-2", 1536, 7),
         ]
-        return [EmbeddingConfig(
-                    embedding_model=model[0],
-                    embedding_endpoint_type="voyageai",
-                    embedding_endpoint=self.base_url,
-                    embedding_dim=model[1],
-                    embedding_chunk_size=model[2],  # NOTE: max is 2048
-                    handle=self.get_handle(model[0], True),
-                ) for model in voyageai_model_config]
+        return [
+            EmbeddingConfig(
+                embedding_model=model[0],
+                embedding_endpoint_type="voyageai",
+                embedding_endpoint=self.base_url,
+                embedding_dim=model[1],
+                embedding_chunk_size=model[2],  # NOTE: max is 2048
+                handle=self.get_handle(model[0], True),
+            )
+            for model in voyageai_model_config
+        ]
 
 
 class MistralProvider(Provider):
