@@ -212,14 +212,8 @@ class VoyageAIEmbeddings:
     def get_text_embedding(self, text: str):
         import httpx
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        json_data = {
-            "model": self.model,
-            "input": [text]
-        }
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        json_data = {"model": self.model, "input": [text]}
         json_data.update(self.additional_kwargs)
 
         with httpx.Client() as client:

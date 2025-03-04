@@ -58,7 +58,8 @@ from letta.schemas.providers import (
     Provider,
     TogetherProvider,
     VLLMChatCompletionsProvider,
-    VLLMCompletionsProvider, VoyageAIProvider,
+    VLLMCompletionsProvider,
+    VoyageAIProvider,
     xAIProvider,
 )
 from letta.schemas.sandbox_config import SandboxType
