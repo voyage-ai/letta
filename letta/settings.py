@@ -115,6 +115,9 @@ class ModelSettings(BaseSettings):
     # disable openapi schema generation
     disable_schema_generation: bool = False
 
+    # voyageai
+    voyage_api_key: Optional[str] = None
+
 
 cors_origins = [
     "http://letta.localhost",
