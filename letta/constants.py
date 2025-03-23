@@ -2,7 +2,7 @@ import os
 from logging import CRITICAL, DEBUG, ERROR, INFO, NOTSET, WARN, WARNING
 
 LETTA_DIR = os.path.join(os.path.expanduser("~"), ".letta")
-LETTA_DIR_TOOL_SANDBOX = os.path.join(LETTA_DIR, "tool_sandbox_dir")
+LETTA_TOOL_EXECUTION_DIR = os.path.join(LETTA_DIR, "tool_execution_dir")
 
 ADMIN_PREFIX = "/v1/admin"
 API_PREFIX = "/v1"
@@ -10,6 +10,9 @@ OPENAI_API_PREFIX = "/openai"
 
 COMPOSIO_ENTITY_ENV_VAR_KEY = "COMPOSIO_ENTITY"
 COMPOSIO_TOOL_TAG_NAME = "composio"
+
+MCP_CONFIG_NAME = "mcp_config.json"
+MCP_TOOL_TAG_NAME_PREFIX = "mcp"  # full format, mcp:server_name
 
 LETTA_CORE_TOOL_MODULE_NAME = "letta.functions.function_sets.base"
 LETTA_MULTI_AGENT_TOOL_MODULE_NAME = "letta.functions.function_sets.multi_agent"
@@ -50,7 +53,7 @@ BASE_TOOLS = ["send_message", "conversation_search", "archival_memory_insert", "
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
 # Multi agent tools
-MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_all_tags", "send_message_to_agent_async"]
+MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_tags", "send_message_to_agent_async"]
 # Set of all built-in Letta tools
 LETTA_TOOL_SET = set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS)
 
@@ -145,6 +148,9 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
         "If there is any important new information or general memories about you or the user that you would like to save, you should save that information immediately by calling function core_memory_append, core_memory_replace, or archival_memory_insert.",
         # "Remember to pass request_heartbeat = true if you would like to send a message immediately after.",
     ]
+)
+DATA_SOURCE_ATTACH_ALERT = (
+    "[ALERT] New data was just uploaded to archival memory. You can view this data by calling the archival_memory_search tool."
 )
 
 # The ackknowledgement message used in the summarize sequence

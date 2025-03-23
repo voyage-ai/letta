@@ -53,6 +53,11 @@ MODEL_LIST = [
         "name": "claude-3-opus-20240229",
         "context_window": 200000,
     },
+    # latest
+    {
+        "name": "claude-3-opus-latest",
+        "context_window": 200000,
+    },
     ## Sonnet
     # 3.0
     {
@@ -69,9 +74,19 @@ MODEL_LIST = [
         "name": "claude-3-5-sonnet-20241022",
         "context_window": 200000,
     },
+    # 3.5 latest
+    {
+        "name": "claude-3-5-sonnet-latest",
+        "context_window": 200000,
+    },
     # 3.7
     {
         "name": "claude-3-7-sonnet-20250219",
+        "context_window": 200000,
+    },
+    # 3.7 latest
+    {
+        "name": "claude-3-7-sonnet-latest",
         "context_window": 200000,
     },
     ## Haiku
@@ -83,6 +98,11 @@ MODEL_LIST = [
     # 3.5
     {
         "name": "claude-3-5-haiku-20241022",
+        "context_window": 200000,
+    },
+    # 3.5 latest
+    {
+        "name": "claude-3-5-haiku-latest",
         "context_window": 200000,
     },
 ]
@@ -586,25 +606,6 @@ def _prepare_anthropic_request(
         # TODO eventually enable parallel tool use
         data["tools"] = anthropic_tools
 
-        # tool_choice_type other than "auto" only plays nice if thinking goes inside the tool calls
-        if put_inner_thoughts_in_kwargs:
-            if len(anthropic_tools) == 1:
-                data["tool_choice"] = {
-                    "type": "tool",
-                    "name": anthropic_tools[0]["name"],
-                    "disable_parallel_tool_use": True,
-                }
-            else:
-                data["tool_choice"] = {
-                    "type": "any",
-                    "disable_parallel_tool_use": True,
-                }
-        else:
-            data["tool_choice"] = {
-                "type": "auto",
-                "disable_parallel_tool_use": True,
-            }
-
     # Move 'system' to the top level
     assert data["messages"][0]["role"] == "system", f"Expected 'system' role in messages[0]:\n{data['messages'][0]}"
     data["system"] = data["messages"][0]["content"]
@@ -700,6 +701,7 @@ def anthropic_bedrock_chat_completions_request(
     # Make the request
     try:
         # bedrock does not support certain args
+        print("Warning: Tool rules not supported with Anthropic Bedrock")
         data["tool_choice"] = {"type": "any"}
         log_event(name="llm_request_sent", attributes=data)
         response = client.messages.create(**data)
@@ -820,7 +822,7 @@ def anthropic_chat_completions_process_stream(
     # Create a dummy message for ID/datetime if needed
     dummy_message = _Message(
         role=_MessageRole.assistant,
-        text="",
+        content=[],
         agent_id="",
         model="",
         name=None,
