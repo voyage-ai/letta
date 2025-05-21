@@ -843,6 +843,8 @@ class VoyageAIProvider(Provider):
         # NOTE: currently there is no GET /models, so we need to hardcode the embedding models
         voyageai_model_config = [
             ("voyage-3-large", 1024, 3),
+            ("voyage-3.5", 1024, 10),
+            ("voyage-3.5-lite", 512, 31),
             ("voyage-3", 1024, 10),
             ("voyage-3-lite", 512, 31),
             ("voyage-code-3", 1024, 3),
