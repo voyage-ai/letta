@@ -1,7 +1,8 @@
-import datetime
 import os
+import random
+import string
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import util
 from typing import Dict, Iterator, List, Tuple
 
@@ -34,7 +35,7 @@ class DummyDataConnector(DataConnector):
                 file_size=0,  # Set to 0 as a placeholder
                 file_creation_date="1970-01-01",  # Placeholder date
                 file_last_modified_date="1970-01-01",  # Placeholder date
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             self.file_to_text[file_metadata.id] = text
 
@@ -176,3 +177,25 @@ def wait_for_incoming_message(
         time.sleep(sleep_interval)
 
     return False
+
+
+def wait_for_server(url, timeout=30, interval=0.5):
+    """Wait for server to become available by polling the given URL."""
+    import requests
+    from requests.exceptions import ConnectionError
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f"{url}/v1/health", timeout=2)
+            if response.status_code == 200:
+                return True
+        except (ConnectionError, requests.Timeout):
+            pass
+        time.sleep(interval)
+
+    raise TimeoutError(f"Server at {url} did not start within {timeout} seconds")
+
+
+def random_string(length: int) -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length))

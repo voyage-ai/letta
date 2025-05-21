@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from letta.local_llm.constants import DEFAULT_WRAPPER_NAME
@@ -16,7 +16,10 @@ class ToolSettings(BaseSettings):
     e2b_sandbox_template_id: Optional[str] = None  # Updated manually
 
     # Local Sandbox configurations
-    local_sandbox_dir: Optional[str] = None
+    tool_exec_dir: Optional[str] = None
+    tool_sandbox_timeout: float = 180
+    tool_exec_venv_name: Optional[str] = None
+    tool_exec_autoreload_venv: bool = True
 
     # MCP settings
     mcp_connect_to_server_timeout: float = 30.0
@@ -67,7 +70,13 @@ class ModelSettings(BaseSettings):
 
     # openai
     openai_api_key: Optional[str] = None
-    openai_api_base: str = "https://api.openai.com/v1"
+    openai_api_base: str = Field(
+        default="https://api.openai.com/v1",
+        # NOTE: We previously used OPENAI_API_BASE, but this was deprecated in favor of OPENAI_BASE_URL
+        # preferred first, fallback second
+        # env=["OPENAI_BASE_URL", "OPENAI_API_BASE"],  # pydantic-settings v2
+        validation_alias=AliasChoices("OPENAI_BASE_URL", "OPENAI_API_BASE"),  # pydantic-settings v1
+    )
 
     # deepseek
     deepseek_api_key: Optional[str] = None
@@ -169,8 +178,8 @@ class Settings(BaseSettings):
     pg_host: Optional[str] = None
     pg_port: Optional[int] = None
     pg_uri: Optional[str] = default_pg_uri  # option to specify full uri
-    pg_pool_size: int = 20  # Concurrent connections
-    pg_max_overflow: int = 10  # Overflow limit
+    pg_pool_size: int = 80  # Concurrent connections
+    pg_max_overflow: int = 30  # Overflow limit
     pg_pool_timeout: int = 30  # Seconds to wait for a connection
     pg_pool_recycle: int = 1800  # When to recycle connections
     pg_echo: bool = False  # Logging
@@ -178,7 +187,7 @@ class Settings(BaseSettings):
     # multi agent settings
     multi_agent_send_message_max_retries: int = 3
     multi_agent_send_message_timeout: int = 20 * 60
-    multi_agent_concurrent_sends: int = 15
+    multi_agent_concurrent_sends: int = 50
 
     # telemetry logging
     verbose_telemetry_logging: bool = False
@@ -189,6 +198,31 @@ class Settings(BaseSettings):
     uvicorn_workers: int = 1
     uvicorn_reload: bool = False
     uvicorn_timeout_keep_alive: int = 5
+
+    # event loop parallelism
+    event_loop_threadpool_max_workers: int = 43
+
+    # experimental toggle
+    use_experimental: bool = False
+    use_vertex_structured_outputs_experimental: bool = False
+    use_vertex_async_loop_experimental: bool = False
+    experimental_enable_async_db_engine: bool = False
+    experimental_skip_rebuild_memory: bool = False
+
+    # LLM provider client settings
+    httpx_max_retries: int = 5
+    httpx_timeout_connect: float = 10.0
+    httpx_timeout_read: float = 60.0
+    httpx_timeout_write: float = 30.0
+    httpx_timeout_pool: float = 10.0
+    httpx_max_connections: int = 500
+    httpx_max_keepalive_connections: int = 500
+    httpx_keepalive_expiry: float = 120.0
+
+    # cron job parameters
+    enable_batch_job_polling: bool = False
+    poll_running_llm_batches_interval_seconds: int = 5 * 60
+    poll_lock_retry_interval_seconds: int = 5 * 60
 
     @property
     def letta_pg_uri(self) -> str:

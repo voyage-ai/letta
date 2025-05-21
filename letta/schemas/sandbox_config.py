@@ -69,8 +69,8 @@ class LocalSandboxConfig(BaseModel):
             return data
 
         if data.get("sandbox_dir") is None:
-            if tool_settings.local_sandbox_dir:
-                data["sandbox_dir"] = tool_settings.local_sandbox_dir
+            if tool_settings.tool_exec_dir:
+                data["sandbox_dir"] = tool_settings.tool_exec_dir
             else:
                 data["sandbox_dir"] = LETTA_TOOL_EXECUTION_DIR
 

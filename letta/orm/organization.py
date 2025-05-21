@@ -23,6 +23,7 @@ class Organization(SqlalchemyBase):
     __pydantic_model__ = PydanticOrganization
 
     name: Mapped[str] = mapped_column(doc="The display name of the organization.")
+    privileged_tools: Mapped[bool] = mapped_column(doc="Whether the organization has access to privileged tools.")
 
     # relationships
     users: Mapped[List["User"]] = relationship("User", back_populates="organization", cascade="all, delete-orphan")
@@ -50,6 +51,10 @@ class Organization(SqlalchemyBase):
     providers: Mapped[List["Provider"]] = relationship("Provider", back_populates="organization", cascade="all, delete-orphan")
     identities: Mapped[List["Identity"]] = relationship("Identity", back_populates="organization", cascade="all, delete-orphan")
     groups: Mapped[List["Group"]] = relationship("Group", back_populates="organization", cascade="all, delete-orphan")
+    llm_batch_jobs: Mapped[List["LLMBatchJob"]] = relationship("LLMBatchJob", back_populates="organization", cascade="all, delete-orphan")
+    llm_batch_items: Mapped[List["LLMBatchItem"]] = relationship(
+        "LLMBatchItem", back_populates="organization", cascade="all, delete-orphan"
+    )
 
     @property
     def passages(self) -> List[Union["SourcePassage", "AgentPassage"]]:

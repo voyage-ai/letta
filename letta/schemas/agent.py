@@ -1,9 +1,10 @@
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE
+from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
+from letta.helpers import ToolRulesSolver
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.environment_variables import AgentEnvironmentVariable
@@ -13,6 +14,7 @@ from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
 from letta.schemas.message import Message, MessageCreate
 from letta.schemas.openai.chat_completion_response import UsageStatistics
+from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.tool_rule import ToolRule
@@ -26,7 +28,9 @@ class AgentType(str, Enum):
 
     memgpt_agent = "memgpt_agent"
     split_thread_agent = "split_thread_agent"
-    offline_memory_agent = "offline_memory_agent"
+    sleeptime_agent = "sleeptime_agent"
+    voice_convo_agent = "voice_convo_agent"
+    voice_sleeptime_agent = "voice_sleeptime_agent"
 
 
 class AgentState(OrmMetadataBase, validate_assignment=True):
@@ -52,7 +56,6 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     name: str = Field(..., description="The name of the agent.")
     # tool rules
     tool_rules: Optional[List[ToolRule]] = Field(default=None, description="The list of tool rules.")
-
     # in-context memory
     message_ids: Optional[List[str]] = Field(default=None, description="The ids of the messages in the agent's in-context memory.")
 
@@ -65,6 +68,9 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     # llm information
     llm_config: LLMConfig = Field(..., description="The LLM configuration used by the agent.")
     embedding_config: EmbeddingConfig = Field(..., description="The embedding configuration used by the agent.")
+    response_format: Optional[ResponseFormatUnion] = Field(
+        None, description="The response format used by the agent when returning from `send_message`."
+    )
 
     # This is an object representing the in-process state of a running `Agent`
     # Field in this object can be theoretically edited by tools, and will be persisted by the ORM
@@ -89,6 +95,10 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     message_buffer_autoclear: bool = Field(
         False,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
+    )
+    enable_sleeptime: Optional[bool] = Field(
+        None,
+        description="If set to True, memory management will move to a background agent thread.",
     )
 
     multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
@@ -147,6 +157,14 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     embedding_chunk_size: Optional[int] = Field(DEFAULT_EMBEDDING_CHUNK_SIZE, description="The embedding chunk size used by the agent.")
+    max_tokens: Optional[int] = Field(
+        None,
+        description="The maximum number of tokens to generate, including reasoning step. If not set, the model will use its default value.",
+    )
+    max_reasoning_tokens: Optional[int] = Field(
+        None, description="The maximum number of tokens to generate for reasoning step. If not set, the model will use its default value."
+    )
+    enable_reasoner: Optional[bool] = Field(False, description="Whether to enable internal extended thinking step for a reasoner model.")
     from_template: Optional[str] = Field(None, description="The template id used to configure the agent")
     template: bool = Field(False, description="Whether the agent is a template")
     project: Optional[str] = Field(
@@ -166,6 +184,8 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         False,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
+    enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
 
     @field_validator("name")
     @classmethod
@@ -211,6 +231,17 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
 
         return embedding
 
+    @model_validator(mode="after")
+    def validate_sleeptime_for_agent_type(self) -> "CreateAgent":
+        """Validate that enable_sleeptime is True when agent_type is a specific value"""
+        AGENT_TYPES_REQUIRING_SLEEPTIME = {AgentType.voice_convo_agent}
+
+        if self.agent_type in AGENT_TYPES_REQUIRING_SLEEPTIME:
+            if not self.enable_sleeptime:
+                raise ValueError(f"Agent type {self.agent_type} requires enable_sleeptime to be True")
+
+        return self
+
 
 class UpdateAgent(BaseModel):
     name: Optional[str] = Field(None, description="The name of the agent.")
@@ -236,6 +267,16 @@ class UpdateAgent(BaseModel):
         None,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
+    model: Optional[str] = Field(
+        None,
+        description="The LLM configuration handle used by the agent, specified in the format "
+        "provider/model-name, as an alternative to specifying llm_config.",
+    )
+    embedding: Optional[str] = Field(
+        None, description="The embedding configuration handle used by the agent, specified in the format provider/model-name."
+    )
+    enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
 
     class Config:
         extra = "ignore"  # Ignores extra fields
@@ -249,3 +290,39 @@ class AgentStepResponse(BaseModel):
         ..., description="Whether the agent step ended because the in-context memory is near its limit."
     )
     usage: UsageStatistics = Field(..., description="Usage statistics of the LLM call during the agent's step.")
+
+
+class AgentStepState(BaseModel):
+    step_number: int = Field(..., description="The current step number in the agent loop")
+    tool_rules_solver: ToolRulesSolver = Field(..., description="The current state of the ToolRulesSolver")
+
+
+def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
+    if agent_type == AgentType.sleeptime_agent:
+        return (
+            "{% for block in blocks %}"
+            '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
+            f"{CORE_MEMORY_LINE_NUMBER_WARNING}"
+            "{% for line in block.value.split('\\n') %}"
+            "Line {{ loop.index }}: {{ line }}\n"
+            "{% endfor %}"
+            "</{{ block.label }}>"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+        )
+    return (
+        "{% for block in blocks %}"
+        "<{{ block.label }}>\n"
+        "<description>\n"
+        "{{ block.description }}\n"
+        "</description>\n"
+        "<metadata>\n"
+        '{% if block.read_only %}read_only="true" {% endif %}chars_current="{{ block.value|length }}" chars_limit="{{ block.limit }}"\n'
+        "</metadata>\n"
+        "<value>\n"
+        "{{ block.value }}\n"
+        "</value>\n"
+        "</{{ block.label }}>\n"
+        "{% if not loop.last %}\n{% endif %}"
+        "{% endfor %}"
+    )

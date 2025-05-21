@@ -9,7 +9,7 @@ from composio.exceptions import (
     EnumMetadataNotFound,
     EnumStringNotFound,
 )
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 
 from letta.errors import LettaToolCreateError
 from letta.functions.mcp_client.exceptions import MCPTimeoutError
@@ -40,6 +40,24 @@ def delete_tool(
     server.tool_manager.delete_tool_by_id(tool_id=tool_id, actor=actor)
 
 
+@router.get("/count", response_model=int, operation_id="count_tools")
+def count_tools(
+    server: SyncServer = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+    include_base_tools: Optional[bool] = Query(False, description="Include built-in Letta tools in the count"),
+):
+    """
+    Get a count of all tools available to agents belonging to the org of the user.
+    """
+    try:
+        return server.tool_manager.size(
+            actor=server.user_manager.get_user_or_default(user_id=actor_id), include_base_tools=include_base_tools
+        )
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{tool_id}", response_model=Tool, operation_id="retrieve_tool")
 def retrieve_tool(
     tool_id: str,
@@ -58,7 +76,7 @@ def retrieve_tool(
 
 
 @router.get("/", response_model=List[Tool], operation_id="list_tools")
-def list_tools(
+async def list_tools(
     after: Optional[str] = None,
     limit: Optional[int] = 50,
     name: Optional[str] = None,
@@ -69,13 +87,28 @@ def list_tools(
     Get a list of all tools available to agents belonging to the org of the user
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
         if name is not None:
-            tool = server.tool_manager.get_tool_by_name(tool_name=name, actor=actor)
+            tool = await server.tool_manager.get_tool_by_name_async(tool_name=name, actor=actor)
             return [tool] if tool else []
-        return server.tool_manager.list_tools(actor=actor, after=after, limit=limit)
+        return await server.tool_manager.list_tools_async(actor=actor, after=after, limit=limit)
     except Exception as e:
         # Log or print the full exception here for debugging
+        print(f"Error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/count", response_model=int, operation_id="count_tools")
+def count_tools(
+    server: SyncServer = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+):
+    """
+    Get a count of all tools available to agents belonging to the org of the user
+    """
+    try:
+        return server.tool_manager.size(actor=server.user_manager.get_user_or_default(user_id=actor_id))
+    except Exception as e:
         print(f"Error occurred: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

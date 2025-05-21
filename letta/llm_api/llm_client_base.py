@@ -1,13 +1,18 @@
 from abc import abstractmethod
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from anthropic.types.beta.messages import BetaMessageBatch
 from openai import AsyncStream, Stream
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
+from letta.errors import LLMError
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
 from letta.tracing import log_event
+
+if TYPE_CHECKING:
+    from letta.orm import User
 
 
 class LLMClientBase:
@@ -18,25 +23,20 @@ class LLMClientBase:
 
     def __init__(
         self,
-        agent_id: str,
-        llm_config: LLMConfig,
         put_inner_thoughts_first: Optional[bool] = True,
-        use_structured_output: Optional[bool] = True,
         use_tool_naming: bool = True,
-        actor_id: Optional[str] = None,
+        actor: Optional["User"] = None,
     ):
-        self.agent_id = agent_id
-        self.llm_config = llm_config
+        self.actor = actor
         self.put_inner_thoughts_first = put_inner_thoughts_first
-        self.actor_id = actor_id
+        self.use_tool_naming = use_tool_naming
 
     def send_llm_request(
         self,
         messages: List[Message],
+        llm_config: LLMConfig,
         tools: Optional[List[dict]] = None,  # TODO: change to Tool object
-        tool_call: Optional[str] = None,
         stream: bool = False,
-        first_message: bool = False,
         force_tool_call: Optional[str] = None,
     ) -> Union[ChatCompletionResponse, Stream[ChatCompletionChunk]]:
         """
@@ -44,22 +44,26 @@ class LLMClientBase:
         If stream=True, returns a Stream[ChatCompletionChunk] that can be iterated over.
         Otherwise returns a ChatCompletionResponse.
         """
-        request_data = self.build_request_data(messages, tools, tool_call)
-        log_event(name="llm_request_sent", attributes=request_data)
-        if stream:
-            return self.stream(request_data)
-        else:
-            response_data = self.request(request_data)
+        request_data = self.build_request_data(messages, llm_config, tools, force_tool_call)
+
+        try:
+            log_event(name="llm_request_sent", attributes=request_data)
+            if stream:
+                return self.stream(request_data, llm_config)
+            else:
+                response_data = self.request(request_data, llm_config)
             log_event(name="llm_response_received", attributes=response_data)
-            return self.convert_response_to_chat_completion(response_data, messages)
+        except Exception as e:
+            raise self.handle_llm_error(e)
+
+        return self.convert_response_to_chat_completion(response_data, messages, llm_config)
 
     async def send_llm_request_async(
         self,
         messages: List[Message],
+        llm_config: LLMConfig,
         tools: Optional[List[dict]] = None,  # TODO: change to Tool object
-        tool_call: Optional[str] = None,
         stream: bool = False,
-        first_message: bool = False,
         force_tool_call: Optional[str] = None,
     ) -> Union[ChatCompletionResponse, AsyncStream[ChatCompletionChunk]]:
         """
@@ -67,21 +71,35 @@ class LLMClientBase:
         If stream=True, returns an AsyncStream[ChatCompletionChunk] that can be async iterated over.
         Otherwise returns a ChatCompletionResponse.
         """
-        request_data = self.build_request_data(messages, tools, tool_call)
-        log_event(name="llm_request_sent", attributes=request_data)
-        if stream:
-            return await self.stream_async(request_data)
-        else:
-            response_data = await self.request_async(request_data)
+        request_data = self.build_request_data(messages, llm_config, tools, force_tool_call)
+
+        try:
+            log_event(name="llm_request_sent", attributes=request_data)
+            if stream:
+                return await self.stream_async(request_data, llm_config)
+            else:
+                response_data = await self.request_async(request_data, llm_config)
             log_event(name="llm_response_received", attributes=response_data)
-            return self.convert_response_to_chat_completion(response_data, messages)
+        except Exception as e:
+            raise self.handle_llm_error(e)
+
+        return self.convert_response_to_chat_completion(response_data, messages, llm_config)
+
+    async def send_llm_batch_request_async(
+        self,
+        agent_messages_mapping: Dict[str, List[Message]],
+        agent_tools_mapping: Dict[str, List[dict]],
+        agent_llm_config_mapping: Dict[str, LLMConfig],
+    ) -> Union[BetaMessageBatch]:
+        raise NotImplementedError
 
     @abstractmethod
     def build_request_data(
         self,
         messages: List[Message],
+        llm_config: LLMConfig,
         tools: List[dict],
-        tool_call: Optional[str],
+        force_tool_call: Optional[str] = None,
     ) -> dict:
         """
         Constructs a request object in the expected data format for this client.
@@ -89,14 +107,14 @@ class LLMClientBase:
         raise NotImplementedError
 
     @abstractmethod
-    def request(self, request_data: dict) -> dict:
+    def request(self, request_data: dict, llm_config: LLMConfig) -> dict:
         """
         Performs underlying request to llm and returns raw response.
         """
         raise NotImplementedError
 
     @abstractmethod
-    async def request_async(self, request_data: dict) -> dict:
+    async def request_async(self, request_data: dict, llm_config: LLMConfig) -> dict:
         """
         Performs underlying request to llm and returns raw response.
         """
@@ -107,6 +125,7 @@ class LLMClientBase:
         self,
         response_data: dict,
         input_messages: List[Message],
+        llm_config: LLMConfig,
     ) -> ChatCompletionResponse:
         """
         Converts custom response format from llm client into an OpenAI
@@ -115,15 +134,29 @@ class LLMClientBase:
         raise NotImplementedError
 
     @abstractmethod
-    def stream(self, request_data: dict) -> Stream[ChatCompletionChunk]:
+    def stream(self, request_data: dict, llm_config: LLMConfig) -> Stream[ChatCompletionChunk]:
         """
         Performs underlying streaming request to llm and returns raw response.
         """
-        raise NotImplementedError(f"Streaming is not supported for {self.llm_config.model_endpoint_type}")
+        raise NotImplementedError(f"Streaming is not supported for {llm_config.model_endpoint_type}")
 
     @abstractmethod
-    async def stream_async(self, request_data: dict) -> AsyncStream[ChatCompletionChunk]:
+    async def stream_async(self, request_data: dict, llm_config: LLMConfig) -> AsyncStream[ChatCompletionChunk]:
         """
         Performs underlying streaming request to llm and returns raw response.
         """
-        raise NotImplementedError(f"Streaming is not supported for {self.llm_config.model_endpoint_type}")
+        raise NotImplementedError(f"Streaming is not supported for {llm_config.model_endpoint_type}")
+
+    @abstractmethod
+    def handle_llm_error(self, e: Exception) -> Exception:
+        """
+        Maps provider-specific errors to common LLMError types.
+        Each LLM provider should implement this to translate their specific errors.
+
+        Args:
+            e: The original provider-specific exception
+
+        Returns:
+            An LLMError subclass that represents the error in a provider-agnostic way
+        """
+        return LLMError(f"Unhandled LLM error: {str(e)}")

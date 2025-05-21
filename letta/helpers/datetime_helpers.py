@@ -1,5 +1,7 @@
 import re
+import time
 from datetime import datetime, timedelta, timezone
+from time import strftime
 
 import pytz
 
@@ -29,6 +31,12 @@ def get_local_time_military():
 
     # You may format it as you desire
     formatted_time = local_time.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+
+    return formatted_time
+
+
+def get_local_time_fast():
+    formatted_time = strftime("%Y-%m-%d %H:%M:%S")
 
     return formatted_time
 
@@ -64,6 +72,20 @@ def get_utc_time() -> datetime:
     """Get the current UTC time"""
     # return datetime.now(pytz.utc)
     return datetime.now(timezone.utc)
+
+
+def get_utc_time_int() -> int:
+    return int(get_utc_time().timestamp())
+
+
+def get_utc_timestamp_ns() -> int:
+    """Get the current UTC time in nanoseconds"""
+    return int(time.time_ns())
+
+
+def timestamp_to_datetime(timestamp_seconds: int) -> datetime:
+    """Convert Unix timestamp in seconds to UTC datetime object"""
+    return datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
 
 
 def format_datetime(dt):

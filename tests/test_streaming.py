@@ -6,6 +6,8 @@ import pytest
 from dotenv import load_dotenv
 from letta_client import AgentState, Letta, LlmConfig, MessageCreate
 
+from letta.schemas.message import Message
+
 
 def run_server():
     load_dotenv()
@@ -21,6 +23,7 @@ def run_server():
 )
 def client(request):
     # Get URL from environment or start server
+    api_url = os.getenv("LETTA_API_URL")
     server_url = os.getenv("LETTA_SERVER_URL", f"http://localhost:8283")
     if not os.getenv("LETTA_SERVER_URL"):
         print("Starting server thread")
@@ -29,8 +32,10 @@ def client(request):
         time.sleep(5)
     print("Running client tests with server:", server_url)
 
+    # Overide the base_url if the LETTA_API_URL is set
+    base_url = api_url if api_url else server_url
     # create the Letta client
-    yield Letta(base_url=server_url, token=None)
+    yield Letta(base_url=base_url, token=None)
 
 
 # Fixture for test agent
@@ -59,7 +64,7 @@ def agent(client: Letta):
     ],
 )
 def test_streaming_send_message(
-    mock_e2b_api_key_none,
+    disable_e2b_api_key,
     client: Letta,
     agent: AgentState,
     stream_tokens: bool,
@@ -73,9 +78,16 @@ def test_streaming_send_message(
     client.agents.modify(agent_id=agent.id, llm_config=config)
 
     # Send streaming message
+    user_message_otid = Message.generate_otid()
     response = client.agents.messages.create_stream(
         agent_id=agent.id,
-        messages=[MessageCreate(role="user", content="This is a test. Repeat after me: 'banana'")],
+        messages=[
+            MessageCreate(
+                role="user",
+                content="This is a test. Repeat after me: 'banana'",
+                otid=user_message_otid,
+            ),
+        ],
         stream_tokens=stream_tokens,
     )
 
@@ -84,6 +96,8 @@ def test_streaming_send_message(
     inner_thoughts_count = 0
     send_message_ran = False
     done = False
+    last_message_id = client.agents.messages.list(agent_id=agent.id, limit=1)[0].id
+    letta_message_otids = [user_message_otid]
 
     assert response, "Sending message failed"
     for chunk in response:
@@ -104,6 +118,8 @@ def test_streaming_send_message(
             assert chunk.prompt_tokens > 1000
             assert chunk.total_tokens > 1000
             done = True
+        else:
+            letta_message_otids.append(chunk.otid)
         print(chunk)
 
     # If stream tokens, we expect at least one inner thought
@@ -111,3 +127,6 @@ def test_streaming_send_message(
     assert inner_thoughts_exist, "No inner thoughts found"
     assert send_message_ran, "send_message function call not found"
     assert done, "Message stream not done"
+
+    messages = client.agents.messages.list(agent_id=agent.id, after=last_message_id)
+    assert [message.otid for message in messages] == letta_message_otids

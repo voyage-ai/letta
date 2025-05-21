@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 import time
@@ -32,6 +33,7 @@ from letta.schemas.message import Message, MessageCreate
 from letta.schemas.openai.chat_completion_response import UsageStatistics
 from letta.schemas.organization import Organization
 from letta.schemas.passage import Passage
+from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.run import Run
 from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfig, SandboxConfigCreate, SandboxConfigUpdate
 from letta.schemas.source import Source, SourceCreate, SourceUpdate
@@ -84,6 +86,7 @@ class AbstractClient(object):
         description: Optional[str] = None,
         tags: Optional[List[str]] = None,
         message_buffer_autoclear: bool = False,
+        response_format: Optional[ResponseFormatUnion] = None,
     ) -> AgentState:
         raise NotImplementedError
 
@@ -100,6 +103,7 @@ class AbstractClient(object):
         message_ids: Optional[List[str]] = None,
         memory: Optional[Memory] = None,
         tags: Optional[List[str]] = None,
+        response_format: Optional[ResponseFormatUnion] = None,
     ):
         raise NotImplementedError
 
@@ -546,12 +550,14 @@ class RESTClient(AbstractClient):
         tool_ids: Optional[List[str]] = None,
         tool_rules: Optional[List[BaseToolRule]] = None,
         include_base_tools: Optional[bool] = True,
+        include_multi_agent_tools: Optional[bool] = False,
         # metadata
         metadata: Optional[Dict] = {"human:": DEFAULT_HUMAN, "persona": DEFAULT_PERSONA},
         description: Optional[str] = None,
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
         message_buffer_autoclear: bool = False,
+        response_format: Optional[ResponseFormatUnion] = None,
     ) -> AgentState:
         """Create an agent
 
@@ -613,6 +619,8 @@ class RESTClient(AbstractClient):
             "tags": tags,
             "include_base_tools": include_base_tools,
             "message_buffer_autoclear": message_buffer_autoclear,
+            "include_multi_agent_tools": include_multi_agent_tools,
+            "response_format": response_format,
         }
 
         # Only add name if it's not None
@@ -651,6 +659,7 @@ class RESTClient(AbstractClient):
         embedding_config: Optional[EmbeddingConfig] = None,
         message_ids: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
+        response_format: Optional[ResponseFormatUnion] = None,
     ) -> AgentState:
         """
         Update an existing agent
@@ -680,6 +689,7 @@ class RESTClient(AbstractClient):
             llm_config=llm_config,
             embedding_config=embedding_config,
             message_ids=message_ids,
+            response_format=response_format,
         )
         response = requests.patch(f"{self.base_url}/{self.api_prefix}/agents/{agent_id}", json=request.model_dump(), headers=self.headers)
         if response.status_code != 200:
@@ -1022,7 +1032,7 @@ class RESTClient(AbstractClient):
             #     messages = []
             #     for m in response.messages:
             #         assert isinstance(m, Message)
-            #         messages += m.to_letta_message()
+            #         messages += m.to_letta_messages()
             #     response.messages = messages
 
             return response
@@ -2344,6 +2354,7 @@ class LocalClient(AbstractClient):
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
         message_buffer_autoclear: bool = False,
+        response_format: Optional[ResponseFormatUnion] = None,
     ) -> AgentState:
         """Create an agent
 
@@ -2397,6 +2408,7 @@ class LocalClient(AbstractClient):
             "initial_message_sequence": initial_message_sequence,
             "tags": tags,
             "message_buffer_autoclear": message_buffer_autoclear,
+            "response_format": response_format,
         }
 
         # Only add name if it's not None
@@ -2423,6 +2435,7 @@ class LocalClient(AbstractClient):
         llm_config: Optional[LLMConfig] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
         message_ids: Optional[List[str]] = None,
+        response_format: Optional[ResponseFormatUnion] = None,
     ):
         """
         Update an existing agent
@@ -2456,6 +2469,7 @@ class LocalClient(AbstractClient):
                 llm_config=llm_config,
                 embedding_config=embedding_config,
                 message_ids=message_ids,
+                response_format=response_format,
             ),
             actor=self.user,
         )
@@ -2659,7 +2673,7 @@ class LocalClient(AbstractClient):
             response (LettaResponse): Response from the agent
         """
         self.interface.clear()
-        usage = self.server.send_messages(actor=self.user, agent_id=agent_id, messages=messages)
+        usage = self.server.send_messages(actor=self.user, agent_id=agent_id, input_messages=messages)
 
         # format messages
         return LettaResponse(messages=messages, usage=usage)
@@ -2701,7 +2715,7 @@ class LocalClient(AbstractClient):
         usage = self.server.send_messages(
             actor=self.user,
             agent_id=agent_id,
-            messages=[MessageCreate(role=MessageRole(role), content=message, name=name)],
+            input_messages=[MessageCreate(role=MessageRole(role), content=message, name=name)],
         )
 
         ## TODO: need to make sure date/timestamp is propely passed
@@ -2712,14 +2726,14 @@ class LocalClient(AbstractClient):
         #    assert isinstance(m, Message), f"Expected Message object, got {type(m)}"
         # letta_messages = []
         # for m in messages:
-        #    letta_messages += m.to_letta_message()
+        #    letta_messages += m.to_letta_messages()
         # return LettaResponse(messages=letta_messages, usage=usage)
 
         # format messages
         messages = self.interface.to_list()
         letta_messages = []
         for m in messages:
-            letta_messages += m.to_letta_message()
+            letta_messages += m.to_letta_messages()
 
         return LettaResponse(messages=letta_messages, usage=usage)
 
@@ -3042,7 +3056,21 @@ class LocalClient(AbstractClient):
         Returns:
             tools (List[Tool]): List of tools
         """
-        return self.server.tool_manager.list_tools(after=after, limit=limit, actor=self.user)
+        # Get the current event loop or create a new one if there isn't one
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context but can't await - use a new loop via run_coroutine_threadsafe
+                concurrent_future = asyncio.run_coroutine_threadsafe(
+                    self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit), loop
+                )
+                return concurrent_future.result()
+            else:
+                # We have a loop but it's not running - we can just run the coroutine
+                return loop.run_until_complete(self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit))
+        except RuntimeError:
+            # No running event loop - create a new one with asyncio.run
+            return asyncio.run(self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit))
 
     def get_tool(self, id: str) -> Optional[Tool]:
         """
@@ -3442,7 +3470,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[LLMConfig]): List of LLM configurations
         """
-        return self.server.list_llm_models()
+        return self.server.list_llm_models(actor=self.user)
 
     def list_embedding_configs(self) -> List[EmbeddingConfig]:
         """
@@ -3451,7 +3479,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[EmbeddingConfig]): List of embedding configurations
         """
-        return self.server.list_embedding_models()
+        return self.server.list_embedding_models(actor=self.user)
 
     def create_org(self, name: Optional[str] = None) -> Organization:
         return self.server.organization_manager.create_organization(pydantic_org=Organization(name=name))

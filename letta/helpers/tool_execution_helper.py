@@ -3,14 +3,14 @@ from typing import Any, Dict, Optional
 
 from letta.constants import COMPOSIO_ENTITY_ENV_VAR_KEY, PRE_EXECUTION_MESSAGE_ARG
 from letta.functions.ast_parsers import coerce_dict_args_by_annotations, get_function_annotations_from_source
-from letta.functions.helpers import execute_composio_action, generate_composio_action_from_func_name
+from letta.functions.composio_helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.helpers.composio_helpers import get_composio_api_key
 from letta.orm.enums import ToolType
 from letta.schemas.agent import AgentState
 from letta.schemas.sandbox_config import SandboxRunResult
 from letta.schemas.tool import Tool
 from letta.schemas.user import User
-from letta.services.tool_execution_sandbox import ToolExecutionSandbox
+from letta.services.tool_executor.tool_execution_sandbox import ToolExecutionSandbox
 from letta.utils import get_friendly_error_msg
 
 
@@ -160,12 +160,12 @@ def execute_external_tool(
             else:
                 agent_state_copy = None
 
-            sandbox_run_result = ToolExecutionSandbox(function_name, function_args, actor).run(agent_state=agent_state_copy)
-            function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
+            tool_execution_result = ToolExecutionSandbox(function_name, function_args, actor).run(agent_state=agent_state_copy)
+            function_response, updated_agent_state = tool_execution_result.func_return, tool_execution_result.agent_state
             # TODO: Bring this back
             # if allow_agent_state_modifications and updated_agent_state is not None:
             #     self.update_memory_if_changed(updated_agent_state.memory)
-            return function_response, sandbox_run_result
+            return function_response, tool_execution_result
     except Exception as e:
         # Need to catch error here, or else trunction wont happen
         # TODO: modify to function execution error

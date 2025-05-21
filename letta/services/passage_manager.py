@@ -1,29 +1,26 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from openai import OpenAI
 
+from letta.constants import MAX_EMBEDDING_DIM
 from letta.embeddings import embedding_model, parse_and_chunk_text
 from letta.orm.errors import NoResultFound
 from letta.orm.passage import AgentPassage, SourcePassage
 from letta.schemas.agent import AgentState
 from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.user import User as PydanticUser
+from letta.server.db import db_registry
 from letta.utils import enforce_types
 
 
 class PassageManager:
     """Manager class to handle business logic related to Passages."""
 
-    def __init__(self):
-        from letta.server.db import db_context
-
-        self.session_maker = db_context
-
     @enforce_types
     def get_passage_by_id(self, passage_id: str, actor: PydanticUser) -> Optional[PydanticPassage]:
         """Fetch a passage by ID."""
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Try source passages first
             try:
                 passage = SourcePassage.read(db_session=session, identifier=passage_id, actor=actor)
@@ -49,7 +46,7 @@ class PassageManager:
             "organization_id": data["organization_id"],
             "metadata_": data.get("metadata", {}),
             "is_deleted": data.get("is_deleted", False),
-            "created_at": data.get("created_at", datetime.utcnow()),
+            "created_at": data.get("created_at", datetime.now(timezone.utc)),
         }
 
         if "agent_id" in data and data["agent_id"]:
@@ -68,7 +65,7 @@ class PassageManager:
         else:
             raise ValueError("Passage must have either agent_id or source_id")
 
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             passage.create(session, actor=actor)
             return passage.to_pydantic()
 
@@ -144,7 +141,7 @@ class PassageManager:
         if not passage_id:
             raise ValueError("Passage ID must be provided.")
 
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Try source passages first
             try:
                 curr_passage = SourcePassage.read(
@@ -178,7 +175,7 @@ class PassageManager:
         if not passage_id:
             raise ValueError("Passage ID must be provided.")
 
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Try source passages first
             try:
                 passage = SourcePassage.read(db_session=session, identifier=passage_id, actor=actor)
@@ -216,5 +213,41 @@ class PassageManager:
             actor: The user requesting the count
             agent_id: The agent ID of the messages
         """
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             return AgentPassage.size(db_session=session, actor=actor, agent_id=agent_id)
+
+    @enforce_types
+    async def size_async(
+        self,
+        actor: PydanticUser,
+        agent_id: Optional[str] = None,
+    ) -> int:
+        """Get the total count of messages with optional filters.
+        Args:
+            actor: The user requesting the count
+            agent_id: The agent ID of the messages
+        """
+        async with db_registry.async_session() as session:
+            return await AgentPassage.size_async(db_session=session, actor=actor, agent_id=agent_id)
+
+    def estimate_embeddings_size(
+        self,
+        actor: PydanticUser,
+        agent_id: Optional[str] = None,
+        storage_unit: str = "GB",
+    ) -> float:
+        """
+        Estimate the size of the embeddings. Defaults to GB.
+        """
+        BYTES_PER_STORAGE_UNIT = {
+            "B": 1,
+            "KB": 1024,
+            "MB": 1024**2,
+            "GB": 1024**3,
+            "TB": 1024**4,
+        }
+        if storage_unit not in BYTES_PER_STORAGE_UNIT:
+            raise ValueError(f"Invalid storage unit: {storage_unit}. Must be one of {list(BYTES_PER_STORAGE_UNIT.keys())}.")
+        BYTES_PER_EMBEDDING_DIM = 4
+        GB_PER_EMBEDDING = BYTES_PER_EMBEDDING_DIM / BYTES_PER_STORAGE_UNIT[storage_unit] * MAX_EMBEDDING_DIM
+        return self.size(actor=actor, agent_id=agent_id) * GB_PER_EMBEDDING

@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
 from composio.client.collections import ActionParametersModel
 from docstring_parser import parse
 from pydantic import BaseModel
+from typing_extensions import Literal
 
 from letta.functions.mcp_client.types import MCPTool
 
@@ -69,6 +70,10 @@ def type_to_json_schema_type(py_type) -> dict:
             # get the type of the items in the list
             "items": type_to_json_schema_type(args[0]),
         }
+
+    # Handle literals
+    if get_origin(py_type) is Literal:
+        return {"type": "string", "enum": get_args(py_type)}
 
     # Handle object types
     if py_type == dict or origin in (dict, Dict):
@@ -461,9 +466,13 @@ def generate_tool_schema_for_mcp(
     name = mcp_tool.name
     description = mcp_tool.description
 
-    assert "type" in parameters_schema
-    assert "required" in parameters_schema
-    assert "properties" in parameters_schema
+    assert "type" in parameters_schema, parameters_schema
+    assert "properties" in parameters_schema, parameters_schema
+    # assert "required" in parameters_schema, parameters_schema
+
+    # Zero-arg tools often omit "required" because nothing is required.
+    # Normalise so downstream code can treat it consistently.
+    parameters_schema.setdefault("required", [])
 
     # Add the optional heartbeat parameter
     if append_heartbeat:

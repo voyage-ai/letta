@@ -1,12 +1,12 @@
 import datetime
 from typing import List, Literal, Optional
 
-from sqlalchemy import and_, func, literal, or_, select
+from sqlalchemy import and_, asc, desc, func, literal, or_, select
 
 from letta import system
 from letta.constants import IN_CONTEXT_MEMORY_KEYWORD, STRUCTURED_OUTPUT_MODELS
 from letta.helpers import ToolRulesSolver
-from letta.helpers.datetime_helpers import get_local_time
+from letta.helpers.datetime_helpers import get_local_time, get_local_time_fast
 from letta.orm.agent import Agent as AgentModel
 from letta.orm.agents_tags import AgentsTags
 from letta.orm.errors import NoResultFound
@@ -20,10 +20,12 @@ from letta.schemas.message import Message, MessageCreate
 from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.tool_rule import ToolRule
 from letta.schemas.user import User
-from letta.system import get_initial_boot_messages, get_login_event
+from letta.system import get_initial_boot_messages, get_login_event, package_function_response
+from letta.tracing import trace_method
 
 
 # Static methods
+@trace_method
 def _process_relationship(
     session, agent: AgentModel, relationship_name: str, model_class, item_ids: List[str], allow_partial=False, replace=True
 ):
@@ -89,13 +91,19 @@ def _process_tags(agent: AgentModel, tags: List[str], replace=True):
         agent.tags.extend([tag for tag in new_tags if tag.tag not in existing_tags])
 
 
-def derive_system_message(agent_type: AgentType, system: Optional[str] = None):
+def derive_system_message(agent_type: AgentType, enable_sleeptime: Optional[bool] = None, system: Optional[str] = None):
     if system is None:
         # TODO: don't hardcode
-        if agent_type == AgentType.memgpt_agent:
+        if agent_type == AgentType.voice_convo_agent:
+            system = gpt_system.get_system_text("voice_chat")
+        elif agent_type == AgentType.voice_sleeptime_agent:
+            system = gpt_system.get_system_text("voice_sleeptime")
+        elif agent_type == AgentType.memgpt_agent and not enable_sleeptime:
             system = gpt_system.get_system_text("memgpt_chat")
-        elif agent_type == AgentType.offline_memory_agent:
-            system = gpt_system.get_system_text("memgpt_offline_memory")
+        elif agent_type == AgentType.memgpt_agent and enable_sleeptime:
+            system = gpt_system.get_system_text("memgpt_sleeptime_chat")
+        elif agent_type == AgentType.sleeptime_agent:
+            system = gpt_system.get_system_text("sleeptime")
         else:
             raise ValueError(f"Invalid agent type: {agent_type}")
 
@@ -115,7 +123,7 @@ def compile_memory_metadata_block(
     # Create a metadata block of info so the agent knows about the metadata of out-of-context memories
     memory_metadata_block = "\n".join(
         [
-            f"### Memory [last modified: {timestamp_str}]",
+            f"### Current Time: {get_local_time_fast()}" f"### Memory [last modified: {timestamp_str}]",
             f"{previous_message_count} previous messages between you and the user are stored in recall memory (use functions to access them)",
             f"{archival_memory_size} total memories you created are stored in archival memory (use functions to access them)",
             (
@@ -192,10 +200,9 @@ def compile_system_message(
         variables[IN_CONTEXT_MEMORY_KEYWORD] = full_memory_string
 
     if template_format == "f-string":
-
+        memory_variable_string = "{" + IN_CONTEXT_MEMORY_KEYWORD + "}"
         # Catch the special case where the system prompt is unformatted
         if append_icm_if_missing:
-            memory_variable_string = "{" + IN_CONTEXT_MEMORY_KEYWORD + "}"
             if memory_variable_string not in system_prompt:
                 # In this case, append it to the end to make sure memory is still injected
                 # warnings.warn(f"{IN_CONTEXT_MEMORY_KEYWORD} variable was missing from system prompt, appending instead")
@@ -203,7 +210,10 @@ def compile_system_message(
 
         # render the variables using the built-in templater
         try:
-            formatted_prompt = safe_format(system_prompt, variables)
+            if user_defined_variables:
+                formatted_prompt = safe_format(system_prompt, variables)
+            else:
+                formatted_prompt = system_prompt.replace(memory_variable_string, full_memory_string)
         except Exception as e:
             raise ValueError(f"Failed to format system prompt - {str(e)}. System prompt value:\n{system_prompt}")
 
@@ -236,7 +246,9 @@ def initialize_message_sequence(
     first_user_message = get_login_event()  # event letting Letta know the user just logged in
 
     if include_initial_boot_message:
-        if agent_state.llm_config.model is not None and "gpt-3.5" in agent_state.llm_config.model:
+        if agent_state.agent_type == AgentType.sleeptime_agent:
+            initial_boot_messages = []
+        elif agent_state.llm_config.model is not None and "gpt-3.5" in agent_state.llm_config.model:
             initial_boot_messages = get_initial_boot_messages("startup_with_send_message_gpt35")
         else:
             initial_boot_messages = get_initial_boot_messages("startup_with_send_message")
@@ -270,23 +282,76 @@ def package_initial_message_sequence(
             packed_message = system.package_user_message(
                 user_message=message_create.content,
             )
+            init_messages.append(
+                Message(
+                    role=message_create.role,
+                    content=[TextContent(text=packed_message)],
+                    name=message_create.name,
+                    organization_id=actor.organization_id,
+                    agent_id=agent_id,
+                    model=model,
+                )
+            )
         elif message_create.role == MessageRole.system:
             packed_message = system.package_system_message(
                 system_message=message_create.content,
             )
+            init_messages.append(
+                Message(
+                    role=message_create.role,
+                    content=[TextContent(text=packed_message)],
+                    name=message_create.name,
+                    organization_id=actor.organization_id,
+                    agent_id=agent_id,
+                    model=model,
+                )
+            )
+        elif message_create.role == MessageRole.assistant:
+            # append tool call to send_message
+            import json
+            import uuid
+
+            from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall
+            from openai.types.chat.chat_completion_message_tool_call import Function as OpenAIFunction
+
+            from letta.constants import DEFAULT_MESSAGE_TOOL
+
+            tool_call_id = str(uuid.uuid4())
+            init_messages.append(
+                Message(
+                    role=MessageRole.assistant,
+                    content=None,
+                    name=message_create.name,
+                    organization_id=actor.organization_id,
+                    agent_id=agent_id,
+                    model=model,
+                    tool_calls=[
+                        OpenAIToolCall(
+                            id=tool_call_id,
+                            type="function",
+                            function=OpenAIFunction(name=DEFAULT_MESSAGE_TOOL, arguments=json.dumps({"message": message_create.content})),
+                        )
+                    ],
+                )
+            )
+
+            # add tool return
+            function_response = package_function_response(True, "None")
+            init_messages.append(
+                Message(
+                    role=MessageRole.tool,
+                    content=[TextContent(text=function_response)],
+                    name=message_create.name,
+                    organization_id=actor.organization_id,
+                    agent_id=agent_id,
+                    model=model,
+                    tool_call_id=tool_call_id,
+                )
+            )
         else:
+            # TODO: add tool call and tool return
             raise ValueError(f"Invalid message role: {message_create.role}")
 
-        init_messages.append(
-            Message(
-                role=message_create.role,
-                content=[TextContent(text=packed_message)],
-                name=message_create.name,
-                organization_id=actor.organization_id,
-                agent_id=agent_id,
-                model=model,
-            )
-        )
     return init_messages
 
 
@@ -299,55 +364,60 @@ def check_supports_structured_output(model: str, tool_rules: List[ToolRule]) -> 
         return True
 
 
-def _apply_pagination(query, before: Optional[str], after: Optional[str], session) -> any:
+def _cursor_filter(created_at_col, id_col, ref_created_at, ref_id, forward: bool):
     """
-    Apply cursor-based pagination filters using the agent's created_at timestamp with id as a tie-breaker.
+    Returns a SQLAlchemy filter expression for cursor-based pagination.
 
-    Instead of relying on the UUID ordering, this function uses the agent's creation time
-    (and id for tie-breaking) to paginate the results. It performs a minimal lookup to fetch
-    only the created_at and id for the agent corresponding to the provided cursor.
-
-    Args:
-        query: The SQLAlchemy query object to modify.
-        before (Optional[str]): Cursor (agent id) to return agents created before this agent.
-        after (Optional[str]): Cursor (agent id) to return agents created after this agent.
-        session: The active database session used to execute the minimal lookup.
-
-    Returns:
-        The modified query with pagination filters applied and ordered by created_at and id.
+    If `forward` is True, returns records after the reference.
+    If `forward` is False, returns records before the reference.
     """
+    if forward:
+        return or_(
+            created_at_col > ref_created_at,
+            and_(created_at_col == ref_created_at, id_col > ref_id),
+        )
+    else:
+        return or_(
+            created_at_col < ref_created_at,
+            and_(created_at_col == ref_created_at, id_col < ref_id),
+        )
+
+
+def _apply_pagination(query, before: Optional[str], after: Optional[str], session, ascending: bool = True) -> any:
     if after:
-        # Retrieve only the created_at and id for the agent corresponding to the 'after' cursor.
         result = session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == after)).first()
         if result:
             after_created_at, after_id = result
-            # Filter: include agents created after the reference, or at the same time but with a greater id.
-            query = query.where(
-                or_(
-                    AgentModel.created_at > after_created_at,
-                    and_(
-                        AgentModel.created_at == after_created_at,
-                        AgentModel.id > after_id,
-                    ),
-                )
-            )
+            query = query.where(_cursor_filter(AgentModel.created_at, AgentModel.id, after_created_at, after_id, forward=ascending))
+
     if before:
-        # Retrieve only the created_at and id for the agent corresponding to the 'before' cursor.
         result = session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == before)).first()
         if result:
             before_created_at, before_id = result
-            # Filter: include agents created before the reference, or at the same time but with a smaller id.
-            query = query.where(
-                or_(
-                    AgentModel.created_at < before_created_at,
-                    and_(
-                        AgentModel.created_at == before_created_at,
-                        AgentModel.id < before_id,
-                    ),
-                )
-            )
-    # Enforce a deterministic ordering: first by created_at, then by id.
-    query = query.order_by(AgentModel.created_at.asc(), AgentModel.id.asc())
+            query = query.where(_cursor_filter(AgentModel.created_at, AgentModel.id, before_created_at, before_id, forward=not ascending))
+
+    # Apply ordering
+    order_fn = asc if ascending else desc
+    query = query.order_by(order_fn(AgentModel.created_at), order_fn(AgentModel.id))
+    return query
+
+
+async def _apply_pagination_async(query, before: Optional[str], after: Optional[str], session, ascending: bool = True) -> any:
+    if after:
+        result = (await session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == after))).first()
+        if result:
+            after_created_at, after_id = result
+            query = query.where(_cursor_filter(AgentModel.created_at, AgentModel.id, after_created_at, after_id, forward=ascending))
+
+    if before:
+        result = (await session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == before))).first()
+        if result:
+            before_created_at, before_id = result
+            query = query.where(_cursor_filter(AgentModel.created_at, AgentModel.id, before_created_at, before_id, forward=not ascending))
+
+    # Apply ordering
+    order_fn = asc if ascending else desc
+    query = query.order_by(order_fn(AgentModel.created_at), order_fn(AgentModel.id))
     return query
 
 

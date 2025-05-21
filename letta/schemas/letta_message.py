@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Annotated, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
@@ -16,6 +17,16 @@ from letta.schemas.letta_message_content import (
 # ---------------------------
 
 
+class MessageType(str, Enum):
+    system_message = "system_message"
+    user_message = "user_message"
+    assistant_message = "assistant_message"
+    reasoning_message = "reasoning_message"
+    hidden_reasoning_message = "hidden_reasoning_message"
+    tool_call_message = "tool_call_message"
+    tool_return_message = "tool_return_message"
+
+
 class LettaMessage(BaseModel):
     """
     Base class for simplified Letta message response type. This is intended to be used for developers
@@ -26,11 +37,18 @@ class LettaMessage(BaseModel):
         id (str): The ID of the message
         date (datetime): The date the message was created in ISO format
         name (Optional[str]): The name of the sender of the message
+        message_type (MessageType): The type of the message
+        otid (Optional[str]): The offline threading id associated with this message
+        sender_id (Optional[str]): The id of the sender of the message, can be an identity id or agent id
     """
 
     id: str
     date: datetime
     name: Optional[str] = None
+    message_type: MessageType = Field(..., description="The type of the message.")
+    otid: Optional[str] = None
+    sender_id: Optional[str] = None
+    step_id: Optional[str] = None
 
     @field_serializer("date")
     def serialize_datetime(self, dt: datetime, _info):
@@ -54,7 +72,7 @@ class SystemMessage(LettaMessage):
         content (str): The message content sent by the system
     """
 
-    message_type: Literal["system_message"] = "system_message"
+    message_type: Literal[MessageType.system_message] = Field(MessageType.system_message, description="The type of the message.")
     content: str = Field(..., description="The message content sent by the system")
 
 
@@ -69,7 +87,7 @@ class UserMessage(LettaMessage):
         content (Union[str, List[LettaUserMessageContentUnion]]): The message content sent by the user (can be a string or an array of multi-modal content parts)
     """
 
-    message_type: Literal["user_message"] = "user_message"
+    message_type: Literal[MessageType.user_message] = Field(MessageType.user_message, description="The type of the message.")
     content: Union[str, List[LettaUserMessageContentUnion]] = Field(
         ...,
         description="The message content sent by the user (can be a string or an array of multi-modal content parts)",
@@ -88,11 +106,13 @@ class ReasoningMessage(LettaMessage):
         source (Literal["reasoner_model", "non_reasoner_model"]): Whether the reasoning
             content was generated natively by a reasoner model or derived via prompting
         reasoning (str): The internal reasoning of the agent
+        signature (Optional[str]): The model-generated signature of the reasoning step
     """
 
-    message_type: Literal["reasoning_message"] = "reasoning_message"
+    message_type: Literal[MessageType.reasoning_message] = Field(MessageType.reasoning_message, description="The type of the message.")
     source: Literal["reasoner_model", "non_reasoner_model"] = "non_reasoner_model"
     reasoning: str
+    signature: Optional[str] = None
 
 
 class HiddenReasoningMessage(LettaMessage):
@@ -106,12 +126,14 @@ class HiddenReasoningMessage(LettaMessage):
         name (Optional[str]): The name of the sender of the message
         state (Literal["redacted", "omitted"]): Whether the reasoning
             content was redacted by the provider or simply omitted by the API
-        reasoning (str): The internal reasoning of the agent
+        hidden_reasoning (Optional[str]): The internal reasoning of the agent
     """
 
-    message_type: Literal["reasoning_message"] = "reasoning_message"
+    message_type: Literal[MessageType.hidden_reasoning_message] = Field(
+        MessageType.hidden_reasoning_message, description="The type of the message."
+    )
     state: Literal["redacted", "omitted"]
-    reasoning: str
+    hidden_reasoning: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -121,9 +143,9 @@ class ToolCall(BaseModel):
 
 
 class ToolCallDelta(BaseModel):
-    name: Optional[str]
-    arguments: Optional[str]
-    tool_call_id: Optional[str]
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+    tool_call_id: Optional[str] = None
 
     def model_dump(self, *args, **kwargs):
         """
@@ -148,7 +170,7 @@ class ToolCallMessage(LettaMessage):
         tool_call (Union[ToolCall, ToolCallDelta]): The tool call
     """
 
-    message_type: Literal["tool_call_message"] = "tool_call_message"
+    message_type: Literal[MessageType.tool_call_message] = Field(MessageType.tool_call_message, description="The type of the message.")
     tool_call: Union[ToolCall, ToolCallDelta]
 
     def model_dump(self, *args, **kwargs):
@@ -200,7 +222,7 @@ class ToolReturnMessage(LettaMessage):
         stderr (Optional[List(str)]): Captured stderr from the tool invocation
     """
 
-    message_type: Literal["tool_return_message"] = "tool_return_message"
+    message_type: Literal[MessageType.tool_return_message] = Field(MessageType.tool_return_message, description="The type of the message.")
     tool_return: str
     status: Literal["success", "error"]
     tool_call_id: str
@@ -219,7 +241,7 @@ class AssistantMessage(LettaMessage):
         content (Union[str, List[LettaAssistantMessageContentUnion]]): The message content sent by the agent (can be a string or an array of content parts)
     """
 
-    message_type: Literal["assistant_message"] = "assistant_message"
+    message_type: Literal[MessageType.assistant_message] = Field(MessageType.assistant_message, description="The type of the message.")
     content: Union[str, List[LettaAssistantMessageContentUnion]] = Field(
         ...,
         description="The message content sent by the agent (can be a string or an array of content parts)",
@@ -229,7 +251,7 @@ class AssistantMessage(LettaMessage):
 
 # NOTE: use Pydantic's discriminated unions feature: https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions
 LettaMessageUnion = Annotated[
-    Union[SystemMessage, UserMessage, ReasoningMessage, ToolCallMessage, ToolReturnMessage, AssistantMessage],
+    Union[SystemMessage, UserMessage, ReasoningMessage, HiddenReasoningMessage, ToolCallMessage, ToolReturnMessage, AssistantMessage],
     Field(discriminator="message_type"),
 ]
 
@@ -240,6 +262,7 @@ def create_letta_message_union_schema():
             {"$ref": "#/components/schemas/SystemMessage"},
             {"$ref": "#/components/schemas/UserMessage"},
             {"$ref": "#/components/schemas/ReasoningMessage"},
+            {"$ref": "#/components/schemas/HiddenReasoningMessage"},
             {"$ref": "#/components/schemas/ToolCallMessage"},
             {"$ref": "#/components/schemas/ToolReturnMessage"},
             {"$ref": "#/components/schemas/AssistantMessage"},
@@ -250,6 +273,7 @@ def create_letta_message_union_schema():
                 "system_message": "#/components/schemas/SystemMessage",
                 "user_message": "#/components/schemas/UserMessage",
                 "reasoning_message": "#/components/schemas/ReasoningMessage",
+                "hidden_reasoning_message": "#/components/schemas/HiddenReasoningMessage",
                 "tool_call_message": "#/components/schemas/ToolCallMessage",
                 "tool_return_message": "#/components/schemas/ToolReturnMessage",
                 "assistant_message": "#/components/schemas/AssistantMessage",

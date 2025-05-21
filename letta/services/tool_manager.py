@@ -2,7 +2,17 @@ import importlib
 import warnings
 from typing import List, Optional
 
-from letta.constants import BASE_FUNCTION_RETURN_CHAR_LIMIT, BASE_MEMORY_TOOLS, BASE_TOOLS, MCP_TOOL_TAG_NAME_PREFIX, MULTI_AGENT_TOOLS
+from letta.constants import (
+    BASE_FUNCTION_RETURN_CHAR_LIMIT,
+    BASE_MEMORY_TOOLS,
+    BASE_SLEEPTIME_TOOLS,
+    BASE_TOOLS,
+    BASE_VOICE_SLEEPTIME_CHAT_TOOLS,
+    BASE_VOICE_SLEEPTIME_TOOLS,
+    LETTA_TOOL_SET,
+    MCP_TOOL_TAG_NAME_PREFIX,
+    MULTI_AGENT_TOOLS,
+)
 from letta.functions.functions import derive_openai_json_schema, load_function_set
 from letta.log import get_logger
 from letta.orm.enums import ToolType
@@ -13,6 +23,7 @@ from letta.orm.tool import Tool as ToolModel
 from letta.schemas.tool import Tool as PydanticTool
 from letta.schemas.tool import ToolCreate, ToolUpdate
 from letta.schemas.user import User as PydanticUser
+from letta.server.db import db_registry
 from letta.utils import enforce_types, printd
 
 logger = get_logger(__name__)
@@ -21,36 +32,28 @@ logger = get_logger(__name__)
 class ToolManager:
     """Manager class to handle business logic related to Tools."""
 
-    BASE_TOOL_NAMES = [
-        "send_message",
-        "conversation_search",
-        "archival_memory_insert",
-        "archival_memory_search",
-    ]
-    BASE_MEMORY_TOOL_NAMES = ["core_memory_append", "core_memory_replace"]
-
-    def __init__(self):
-        # Fetching the db_context similarly as in OrganizationManager
-        from letta.server.db import db_context
-
-        self.session_maker = db_context
-
     # TODO: Refactor this across the codebase to use CreateTool instead of passing in a Tool object
     @enforce_types
     def create_or_update_tool(self, pydantic_tool: PydanticTool, actor: PydanticUser) -> PydanticTool:
         """Create a new tool based on the ToolCreate schema."""
-        tool = self.get_tool_by_name(tool_name=pydantic_tool.name, actor=actor)
-        if tool:
+        tool_id = self.get_tool_id_by_name(tool_name=pydantic_tool.name, actor=actor)
+        if tool_id:
             # Put to dict and remove fields that should not be reset
             update_data = pydantic_tool.model_dump(exclude_unset=True, exclude_none=True)
 
             # If there's anything to update
             if update_data:
-                self.update_tool_by_id(tool.id, ToolUpdate(**update_data), actor)
+                # In case we want to update the tool type
+                # Useful if we are shuffling around base tools
+                updated_tool_type = None
+                if "tool_type" in update_data:
+                    updated_tool_type = update_data.get("tool_type")
+                tool = self.update_tool_by_id(tool_id, ToolUpdate(**update_data), actor, updated_tool_type=updated_tool_type)
             else:
                 printd(
                     f"`create_or_update_tool` was called with user_id={actor.id}, organization_id={actor.organization_id}, name={pydantic_tool.name}, but found existing tool with nothing to update."
                 )
+                tool = self.get_tool_by_id(tool_id, actor=actor)
         else:
             tool = self.create_tool(pydantic_tool, actor=actor)
 
@@ -81,7 +84,7 @@ class ToolManager:
     @enforce_types
     def create_tool(self, pydantic_tool: PydanticTool, actor: PydanticUser) -> PydanticTool:
         """Create a new tool based on the ToolCreate schema."""
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Set the organization id at the ORM layer
             pydantic_tool.organization_id = actor.organization_id
             # Auto-generate description if not provided
@@ -96,7 +99,7 @@ class ToolManager:
     @enforce_types
     def get_tool_by_id(self, tool_id: str, actor: PydanticUser) -> PydanticTool:
         """Fetch a tool by its ID."""
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Retrieve tool by id using the Tool model's read method
             tool = ToolModel.read(db_session=session, identifier=tool_id, actor=actor)
             # Convert the SQLAlchemy Tool object to PydanticTool
@@ -106,17 +109,37 @@ class ToolManager:
     def get_tool_by_name(self, tool_name: str, actor: PydanticUser) -> Optional[PydanticTool]:
         """Retrieve a tool by its name and a user. We derive the organization from the user, and retrieve that tool."""
         try:
-            with self.session_maker() as session:
+            with db_registry.session() as session:
                 tool = ToolModel.read(db_session=session, name=tool_name, actor=actor)
                 return tool.to_pydantic()
         except NoResultFound:
             return None
 
     @enforce_types
-    def list_tools(self, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50) -> List[PydanticTool]:
+    async def get_tool_by_name_async(self, tool_name: str, actor: PydanticUser) -> Optional[PydanticTool]:
+        """Retrieve a tool by its name and a user. We derive the organization from the user, and retrieve that tool."""
+        try:
+            async with db_registry.async_session() as session:
+                tool = await ToolModel.read_async(db_session=session, name=tool_name, actor=actor)
+                return tool.to_pydantic()
+        except NoResultFound:
+            return None
+
+    @enforce_types
+    def get_tool_id_by_name(self, tool_name: str, actor: PydanticUser) -> Optional[str]:
+        """Retrieve a tool by its name and a user. We derive the organization from the user, and retrieve that tool."""
+        try:
+            with db_registry.session() as session:
+                tool = ToolModel.read(db_session=session, name=tool_name, actor=actor)
+                return tool.id
+        except NoResultFound:
+            return None
+
+    @enforce_types
+    async def list_tools_async(self, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50) -> List[PydanticTool]:
         """List all tools with optional pagination."""
-        with self.session_maker() as session:
-            tools = ToolModel.list(
+        async with db_registry.async_session() as session:
+            tools = await ToolModel.list_async(
                 db_session=session,
                 after=after,
                 limit=limit,
@@ -138,9 +161,27 @@ class ToolManager:
         return results
 
     @enforce_types
-    def update_tool_by_id(self, tool_id: str, tool_update: ToolUpdate, actor: PydanticUser) -> PydanticTool:
+    def size(
+        self,
+        actor: PydanticUser,
+        include_base_tools: bool,
+    ) -> int:
+        """
+        Get the total count of tools for the given user.
+
+        If include_builtin is True, it will also count the built-in tools.
+        """
+        with db_registry.session() as session:
+            if include_base_tools:
+                return ToolModel.size(db_session=session, actor=actor)
+            return ToolModel.size(db_session=session, actor=actor, name=LETTA_TOOL_SET)
+
+    @enforce_types
+    def update_tool_by_id(
+        self, tool_id: str, tool_update: ToolUpdate, actor: PydanticUser, updated_tool_type: Optional[ToolType] = None
+    ) -> PydanticTool:
         """Update a tool by its ID with the given ToolUpdate object."""
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             # Fetch the tool by ID
             tool = ToolModel.read(db_session=session, identifier=tool_id, actor=actor)
 
@@ -157,13 +198,16 @@ class ToolManager:
                 tool.json_schema = new_schema
                 tool.name = new_schema["name"]
 
+            if updated_tool_type:
+                tool.tool_type = updated_tool_type
+
             # Save the updated tool to the database
             return tool.update(db_session=session, actor=actor).to_pydantic()
 
     @enforce_types
     def delete_tool_by_id(self, tool_id: str, actor: PydanticUser) -> None:
         """Delete a tool by its ID."""
-        with self.session_maker() as session:
+        with db_registry.session() as session:
             try:
                 tool = ToolModel.read(db_session=session, identifier=tool_id, actor=actor)
                 tool.hard_delete(db_session=session, actor=actor)
@@ -174,7 +218,7 @@ class ToolManager:
     def upsert_base_tools(self, actor: PydanticUser) -> List[PydanticTool]:
         """Add default tools in base.py and multi_agent.py"""
         functions_to_schema = {}
-        module_names = ["base", "multi_agent"]
+        module_names = ["base", "multi_agent", "voice"]
 
         for module_name in module_names:
             full_module_name = f"letta.functions.function_sets.{module_name}"
@@ -194,7 +238,7 @@ class ToolManager:
         # create tool in db
         tools = []
         for name, schema in functions_to_schema.items():
-            if name in BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS:
+            if name in LETTA_TOOL_SET:
                 if name in BASE_TOOLS:
                     tool_type = ToolType.LETTA_CORE
                     tags = [tool_type.value]
@@ -204,9 +248,15 @@ class ToolManager:
                 elif name in MULTI_AGENT_TOOLS:
                     tool_type = ToolType.LETTA_MULTI_AGENT_CORE
                     tags = [tool_type.value]
+                elif name in BASE_SLEEPTIME_TOOLS:
+                    tool_type = ToolType.LETTA_SLEEPTIME_CORE
+                    tags = [tool_type.value]
+                elif name in BASE_VOICE_SLEEPTIME_TOOLS or name in BASE_VOICE_SLEEPTIME_CHAT_TOOLS:
+                    tool_type = ToolType.LETTA_VOICE_SLEEPTIME_CORE
+                    tags = [tool_type.value]
                 else:
                     raise ValueError(
-                        f"Tool name {name} is not in the list of base tool names: {BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS}"
+                        f"Tool name {name} is not in the list of base tool names: {BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS + BASE_VOICE_SLEEPTIME_TOOLS + BASE_VOICE_SLEEPTIME_CHAT_TOOLS}"
                     )
 
                 # create to tool
@@ -224,5 +274,4 @@ class ToolManager:
                 )
 
         # TODO: Delete any base tools that are stale
-
         return tools

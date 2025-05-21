@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SystemMessage(BaseModel):
@@ -46,7 +46,7 @@ ChatMessage = Union[SystemMessage, UserMessage, AssistantMessage, ToolMessage]
 def cast_message_to_subtype(m_dict: dict) -> ChatMessage:
     """Cast a dictionary to one of the individual message types"""
     role = m_dict.get("role")
-    if role == "system":
+    if role == "system" or role == "developer":
         return SystemMessage(**m_dict)
     elif role == "user":
         return UserMessage(**m_dict)
@@ -55,7 +55,7 @@ def cast_message_to_subtype(m_dict: dict) -> ChatMessage:
     elif role == "tool":
         return ToolMessage(**m_dict)
     else:
-        raise ValueError("Unknown message role")
+        raise ValueError(f"Unknown message role: {role}")
 
 
 class ResponseFormat(BaseModel):
@@ -133,6 +133,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 1
     top_p: Optional[float] = 1
     user: Optional[str] = None  # unique ID of the end-user (for monitoring)
+    parallel_tool_calls: Optional[bool] = None
+    instructions: Optional[str] = None
 
     # function-calling related
     tools: Optional[List[Tool]] = None
@@ -140,3 +142,8 @@ class ChatCompletionRequest(BaseModel):
     # deprecated scheme
     functions: Optional[List[FunctionSchema]] = None
     function_call: Optional[FunctionCallChoice] = None
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def cast_all_messages(cls, v):
+        return [cast_message_to_subtype(m) if isinstance(m, dict) else m for m in v]

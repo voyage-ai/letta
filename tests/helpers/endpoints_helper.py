@@ -105,13 +105,13 @@ def check_first_response_is_valid_for_llm_endpoint(filename: str, validate_inner
     agent = Agent(agent_state=full_agent_state, interface=None, user=client.user)
 
     llm_client = LLMClient.create(
-        agent_id=agent_state.id,
-        llm_config=agent_state.llm_config,
-        actor_id=str(uuid.UUID(int=1)),
+        provider_type=agent_state.llm_config.model_endpoint_type,
+        actor=client.user,
     )
     if llm_client:
         response = llm_client.send_llm_request(
             messages=messages,
+            llm_config=agent_state.llm_config,
             tools=[t.json_schema for t in agent.agent_state.tools],
         )
     else:
@@ -180,7 +180,7 @@ def check_agent_uses_external_tool(filename: str) -> LettaResponse:
 
     Note: This is acting on the Letta response, note the usage of `user_message`
     """
-    from composio_langchain import Action
+    from composio import Action
 
     # Set up client
     client = create_client()

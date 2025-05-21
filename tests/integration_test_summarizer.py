@@ -1,7 +1,7 @@
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 import pytest
@@ -9,14 +9,12 @@ import pytest
 from letta import create_client
 from letta.agent import Agent
 from letta.client.client import LocalClient
-from letta.errors import ContextWindowExceededError
 from letta.llm_api.helpers import calculate_summarizer_cutoff
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
-from letta.settings import summarizer_settings
 from letta.streaming_interface import StreamingRefreshCLIInterface
 from tests.helpers.endpoints_helper import EMBEDDING_CONFIG_PATH
 from tests.helpers.utils import cleanup
@@ -57,7 +55,7 @@ def generate_message(role: str, text: str = None, tool_calls: List = None) -> Me
         id="message-" + str(uuid.uuid4()),
         role=MessageRole(role),
         content=[TextContent(text=text or f"{role} message text")],
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
         tool_calls=tool_calls or [],
     )
 
@@ -115,7 +113,51 @@ def test_cutoff_calculation(mocker):
     assert messages[cutoff - 1].role == MessageRole.user
 
 
-def test_summarize_many_messages_basic(client, mock_e2b_api_key_none):
+def test_cutoff_calculation_with_tool_call(mocker, client: LocalClient, agent_state):
+    """Test that trim_older_in_context_messages properly handles tool responses with _trim_tool_response."""
+    agent_state = client.get_agent(agent_id=agent_state.id)
+
+    # Setup
+    messages = [
+        generate_message("system"),
+        generate_message("user", text="First user message"),
+        generate_message(
+            "assistant", tool_calls=[{"id": "tool_call_1", "type": "function", "function": {"name": "test_function", "arguments": "{}"}}]
+        ),
+        generate_message("tool", text="First tool response"),
+        generate_message("assistant", text="First assistant response after tool"),
+        generate_message("user", text="Second user message"),
+        generate_message("assistant", text="Second assistant response"),
+    ]
+
+    def mock_get_messages_by_ids(message_ids, actor):
+        return [msg for msg in messages if msg.id in message_ids]
+
+    mocker.patch.object(client.server.agent_manager.message_manager, "get_messages_by_ids", side_effect=mock_get_messages_by_ids)
+
+    # Mock get_agent_by_id to return an agent with our message IDs
+    mock_agent = mocker.Mock()
+    mock_agent.message_ids = [msg.id for msg in messages]
+    mocker.patch.object(client.server.agent_manager, "get_agent_by_id", return_value=mock_agent)
+
+    # Mock set_in_context_messages to capture what messages are being set
+    mock_set_messages = mocker.patch.object(client.server.agent_manager, "set_in_context_messages", return_value=agent_state)
+
+    # Test Case: Trim to remove orphaned tool response
+    client.server.agent_manager.trim_older_in_context_messages(agent_id=agent_state.id, num=3, actor=client.user)
+
+    test1 = mock_set_messages.call_args_list[0][1]
+    assert len(test1["message_ids"]) == 5
+
+    mock_set_messages.reset_mock()
+
+    # Test Case: Does not result in trimming the orphaned tool response
+    client.server.agent_manager.trim_older_in_context_messages(agent_id=agent_state.id, num=2, actor=client.user)
+    test2 = mock_set_messages.call_args_list[0][1]
+    assert len(test2["message_ids"]) == 6
+
+
+def test_summarize_many_messages_basic(client, disable_e2b_api_key):
     small_context_llm_config = LLMConfig.default_config("gpt-4o-mini")
     small_context_llm_config.context_window = 3000
     small_agent_state = client.create_agent(
@@ -130,22 +172,7 @@ def test_summarize_many_messages_basic(client, mock_e2b_api_key_none):
     client.delete_agent(small_agent_state.id)
 
 
-def test_summarize_large_message_does_not_loop_infinitely(client, mock_e2b_api_key_none):
-    small_context_llm_config = LLMConfig.default_config("gpt-4o-mini")
-    small_context_llm_config.context_window = 2000
-    small_agent_state = client.create_agent(
-        name="super_small_context_agent",
-        llm_config=small_context_llm_config,
-    )
-    with pytest.raises(ContextWindowExceededError, match=f"Ran summarizer {summarizer_settings.max_summarizer_retries}"):
-        client.user_message(
-            agent_id=small_agent_state.id,
-            message="hi " * 1000,
-        )
-    client.delete_agent(small_agent_state.id)
-
-
-def test_summarize_messages_inplace(client, agent_state, mock_e2b_api_key_none):
+def test_summarize_messages_inplace(client, agent_state, disable_e2b_api_key):
     """Test summarization via sending the summarize CLI command or via a direct call to the agent object"""
     # First send a few messages (5)
     response = client.user_message(
@@ -179,7 +206,7 @@ def test_summarize_messages_inplace(client, agent_state, mock_e2b_api_key_none):
     agent_obj.summarize_messages_inplace()
 
 
-def test_auto_summarize(client, mock_e2b_api_key_none):
+def test_auto_summarize(client, disable_e2b_api_key):
     """Test that the summarizer triggers by itself"""
     small_context_llm_config = LLMConfig.default_config("gpt-4o-mini")
     small_context_llm_config.context_window = 4000

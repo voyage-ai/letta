@@ -1,24 +1,30 @@
 import json
 import traceback
-from datetime import datetime
-from typing import Annotated, List, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from marshmallow import ValidationError
+from orjson import orjson
 from pydantic import Field
 from sqlalchemy.exc import IntegrityError, OperationalError
+from starlette.responses import Response, StreamingResponse
 
+from letta.agents.letta_agent import LettaAgent
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.helpers.datetime_helpers import get_utc_timestamp_ns
 from letta.log import get_logger
 from letta.orm.errors import NoResultFound
-from letta.schemas.agent import AgentState, CreateAgent, UpdateAgent
+from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
 from letta.schemas.block import Block, BlockUpdate
+from letta.schemas.group import Group
 from letta.schemas.job import JobStatus, JobUpdate, LettaRequestConfig
 from letta.schemas.letta_message import LettaMessageUnion, LettaMessageUpdateUnion
 from letta.schemas.letta_request import LettaRequest, LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.memory import ContextWindowOverview, CreateArchivalMemory, Memory
+from letta.schemas.message import MessageCreate
 from letta.schemas.passage import Passage, PassageUpdate
 from letta.schemas.run import Run
 from letta.schemas.source import Source
@@ -27,6 +33,7 @@ from letta.schemas.user import User
 from letta.serialize_schemas.pydantic_agent_schema import AgentSchema
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
+from letta.settings import settings
 
 # These can be forward refs, but because Fastapi needs them at runtime the must be imported normally
 
@@ -37,7 +44,7 @@ logger = get_logger(__name__)
 
 
 @router.get("/", response_model=List[AgentState], operation_id="list_agents")
-def list_agents(
+async def list_agents(
     name: Optional[str] = Query(None, description="Name of the agent"),
     tags: Optional[List[str]] = Query(None, description="List of tags to filter agents by"),
     match_all_tags: bool = Query(
@@ -63,6 +70,10 @@ def list_agents(
             "Using this can optimize performance by reducing unnecessary joins."
         ),
     ),
+    ascending: bool = Query(
+        False,
+        description="Whether to sort agents oldest to newest (True) or newest to oldest (False, default)",
+    ),
 ):
     """
     List all agents associated with a given user.
@@ -72,10 +83,10 @@ def list_agents(
     """
 
     # Retrieve the actor (user) details
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     # Call list_agents directly without unnecessary dict handling
-    return server.agent_manager.list_agents(
+    return await server.agent_manager.list_agents_async(
         actor=actor,
         name=name,
         before=before,
@@ -90,22 +101,45 @@ def list_agents(
         identity_id=identity_id,
         identifier_keys=identifier_keys,
         include_relationships=include_relationships,
+        ascending=ascending,
     )
 
 
-@router.get("/{agent_id}/export", operation_id="export_agent_serialized", response_model=AgentSchema)
+@router.get("/count", response_model=int, operation_id="count_agents")
+def count_agents(
+    server: SyncServer = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+):
+    """
+    Get the count of all agents associated with a given user.
+    """
+    return server.agent_manager.size(actor=server.user_manager.get_user_or_default(user_id=actor_id))
+
+
+class IndentedORJSONResponse(Response):
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return orjson.dumps(content, option=orjson.OPT_INDENT_2)
+
+
+@router.get("/{agent_id}/export", response_class=IndentedORJSONResponse, operation_id="export_agent_serialized")
 def export_agent_serialized(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
-) -> AgentSchema:
+    # do not remove, used to autogeneration of spec
+    # TODO: Think of a better way to export AgentSchema
+    spec: Optional[AgentSchema] = None,
+) -> JSONResponse:
     """
-    Export the serialized JSON representation of an agent.
+    Export the serialized JSON representation of an agent, formatted with indentation.
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
 
     try:
-        return server.agent_manager.serialize(agent_id=agent_id, actor=actor)
+        agent = server.agent_manager.serialize(agent_id=agent_id, actor=actor)
+        return agent.model_dump()
     except NoResultFound:
         raise HTTPException(status_code=404, detail=f"Agent with id={agent_id} not found for user_id={actor.id}.")
 
@@ -121,11 +155,15 @@ async def import_agent_serialized(
         description="If set to True, existing tools can get their source code overwritten by the uploaded tool definitions. Note that Letta core tools can never be updated externally.",
     ),
     project_id: Optional[str] = Query(None, description="The project ID to associate the uploaded agent with."),
+    strip_messages: bool = Query(
+        False,
+        description="If set to True, strips all messages from the agent before importing.",
+    ),
 ):
     """
     Import a serialized agent file and recreate the agent in the system.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     try:
         serialized_data = await file.read()
@@ -140,6 +178,7 @@ async def import_agent_serialized(
             append_copy_suffix=append_copy_suffix,
             override_existing_tools=override_existing_tools,
             project_id=project_id,
+            strip_messages=strip_messages,
         )
         return new_agent
 
@@ -147,7 +186,7 @@ async def import_agent_serialized(
         raise HTTPException(status_code=400, detail="Corrupted agent file format.")
 
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=f"Invalid agent schema: {e.errors()}")
+        raise HTTPException(status_code=422, detail=f"Invalid agent schema: {str(e)}")
 
     except IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"Database integrity error: {str(e)}")
@@ -184,7 +223,7 @@ class CreateAgentRequest(CreateAgent):
 
 
 @router.post("/", response_model=AgentState, operation_id="create_agent")
-def create_agent(
+async def create_agent(
     agent: CreateAgentRequest = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -194,23 +233,23 @@ def create_agent(
     Create a new agent with the specified configuration.
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
-        return server.create_agent(agent, actor=actor)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        return await server.create_agent_async(agent, actor=actor)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/{agent_id}", response_model=AgentState, operation_id="modify_agent")
-def modify_agent(
+async def modify_agent(
     agent_id: str,
     update_agent: UpdateAgent = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """Update an existing agent"""
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.agent_manager.update_agent(agent_id=agent_id, agent_update=update_agent, actor=actor)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    return await server.update_agent_async(agent_id=agent_id, request=update_agent, actor=actor)
 
 
 @router.get("/{agent_id}/tools", response_model=List[Tool], operation_id="list_agent_tools")
@@ -256,6 +295,7 @@ def detach_tool(
 def attach_source(
     agent_id: str,
     source_id: str,
+    background_tasks: BackgroundTasks,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
 ):
@@ -263,7 +303,11 @@ def attach_source(
     Attach a source to an agent.
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.agent_manager.attach_source(agent_id=agent_id, source_id=source_id, actor=actor)
+    agent = server.agent_manager.attach_source(agent_id=agent_id, source_id=source_id, actor=actor)
+    if agent.enable_sleeptime:
+        source = server.source_manager.get_source_by_id(source_id=source_id)
+        background_tasks.add_task(server.sleeptime_document_ingest, agent, source, actor)
+    return agent
 
 
 @router.patch("/{agent_id}/sources/detach/{source_id}", response_model=AgentState, operation_id="detach_source_from_agent")
@@ -277,11 +321,19 @@ def detach_source(
     Detach a source from an agent.
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.agent_manager.detach_source(agent_id=agent_id, source_id=source_id, actor=actor)
+    agent = server.agent_manager.detach_source(agent_id=agent_id, source_id=source_id, actor=actor)
+    if agent.enable_sleeptime:
+        try:
+            source = server.source_manager.get_source_by_id(source_id=source_id)
+            block = server.agent_manager.get_block_with_label(agent_id=agent.id, block_label=source.name, actor=actor)
+            server.block_manager.delete_block(block.id, actor)
+        except:
+            pass
+    return agent
 
 
 @router.get("/{agent_id}", response_model=AgentState, operation_id="retrieve_agent")
-def retrieve_agent(
+async def retrieve_agent(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -292,7 +344,7 @@ def retrieve_agent(
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
 
     try:
-        return server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
+        return await server.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
     except NoResultFound as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -362,7 +414,7 @@ def retrieve_block(
 
 
 @router.get("/{agent_id}/core-memory/blocks", response_model=List[Block], operation_id="list_core_memory_blocks")
-def list_blocks(
+async def list_blocks(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -372,7 +424,7 @@ def list_blocks(
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
     try:
-        agent = server.agent_manager.get_agent_by_id(agent_id, actor=actor)
+        agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
         return agent.memory.blocks
     except NoResultFound as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -432,9 +484,13 @@ def detach_block(
 def list_passages(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
-    after: Optional[int] = Query(None, description="Unique ID of the memory to start the query range at."),
-    before: Optional[int] = Query(None, description="Unique ID of the memory to end the query range at."),
+    after: Optional[str] = Query(None, description="Unique ID of the memory to start the query range at."),
+    before: Optional[str] = Query(None, description="Unique ID of the memory to end the query range at."),
     limit: Optional[int] = Query(None, description="How many results to include in the response."),
+    search: Optional[str] = Query(None, description="Search passages by text"),
+    ascending: Optional[bool] = Query(
+        True, description="Whether to sort passages oldest to newest (True, default) or newest to oldest (False)"
+    ),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """
@@ -447,7 +503,9 @@ def list_passages(
         agent_id=agent_id,
         after=after,
         before=before,
+        query_text=search,
         limit=limit,
+        ascending=ascending,
     )
 
 
@@ -512,6 +570,7 @@ def list_messages(
     after: Optional[str] = Query(None, description="Message after which to retrieve the returned messages."),
     before: Optional[str] = Query(None, description="Message before which to retrieve the returned messages."),
     limit: int = Query(10, description="Maximum number of messages to retrieve."),
+    group_id: Optional[str] = Query(None, description="Group ID to filter messages by."),
     use_assistant_message: bool = Query(True, description="Whether to use assistant messages"),
     assistant_message_tool_name: str = Query(DEFAULT_MESSAGE_TOOL, description="The name of the designated message tool."),
     assistant_message_tool_kwarg: str = Query(DEFAULT_MESSAGE_TOOL_KWARG, description="The name of the message argument."),
@@ -528,6 +587,7 @@ def list_messages(
         after=after,
         before=before,
         limit=limit,
+        group_id=group_id,
         reverse=True,
         return_message_object=False,
         use_assistant_message=use_assistant_message,
@@ -559,6 +619,7 @@ def modify_message(
 )
 async def send_message(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -567,18 +628,37 @@ async def send_message(
     Process a user message and return the agent's response.
     This endpoint accepts a message from a user and processes it through the agent.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    result = await server.send_message_to_agent(
-        agent_id=agent_id,
-        actor=actor,
-        messages=request.messages,
-        stream_steps=False,
-        stream_tokens=False,
-        # Support for AssistantMessage
-        use_assistant_message=request.use_assistant_message,
-        assistant_message_tool_name=request.assistant_message_tool_name,
-        assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
-    )
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    # TODO: This is redundant, remove soon
+    agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("X-EXPERIMENTAL") or "false"
+    feature_enabled = settings.use_experimental or experimental_header.lower() == "true"
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai", "google_vertex", "google_ai"]
+
+    if agent_eligible and feature_enabled and model_compatible:
+        experimental_agent = LettaAgent(
+            agent_id=agent_id,
+            message_manager=server.message_manager,
+            agent_manager=server.agent_manager,
+            block_manager=server.block_manager,
+            passage_manager=server.passage_manager,
+            actor=actor,
+        )
+
+        result = await experimental_agent.step(request.messages, max_steps=10, use_assistant_message=request.use_assistant_message)
+    else:
+        result = await server.send_message_to_agent(
+            agent_id=agent_id,
+            actor=actor,
+            input_messages=request.messages,
+            stream_steps=False,
+            stream_tokens=False,
+            # Support for AssistantMessage
+            use_assistant_message=request.use_assistant_message,
+            assistant_message_tool_name=request.assistant_message_tool_name,
+            assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
+        )
     return result
 
 
@@ -589,35 +669,61 @@ async def send_message(
     responses={
         200: {
             "description": "Successful response",
-            "content": {
-                "text/event-stream": {"description": "Server-Sent Events stream"},
-            },
+            "content": {"text/event-stream": {}},
         }
     },
 )
 async def send_message_streaming(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaStreamingRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
-):
+) -> StreamingResponse | LettaResponse:
     """
     Process a user message and return the agent's response.
     This endpoint accepts a message from a user and processes it through the agent.
     It will stream the steps of the response always, and stream the tokens if 'stream_tokens' is set to True.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    result = await server.send_message_to_agent(
-        agent_id=agent_id,
-        actor=actor,
-        messages=request.messages,
-        stream_steps=True,
-        stream_tokens=request.stream_tokens,
-        # Support for AssistantMessage
-        use_assistant_message=request.use_assistant_message,
-        assistant_message_tool_name=request.assistant_message_tool_name,
-        assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
-    )
+    request_start_timestamp_ns = get_utc_timestamp_ns()
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    # TODO: This is redundant, remove soon
+    agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("X-EXPERIMENTAL") or "false"
+    feature_enabled = settings.use_experimental or experimental_header.lower() == "true"
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai"]
+
+    if agent_eligible and feature_enabled and model_compatible and request.stream_tokens:
+        experimental_agent = LettaAgent(
+            agent_id=agent_id,
+            message_manager=server.message_manager,
+            agent_manager=server.agent_manager,
+            block_manager=server.block_manager,
+            passage_manager=server.passage_manager,
+            actor=actor,
+        )
+
+        result = StreamingResponse(
+            experimental_agent.step_stream(
+                request.messages, max_steps=10, use_assistant_message=request.use_assistant_message, stream_tokens=request.stream_tokens
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        result = await server.send_message_to_agent(
+            agent_id=agent_id,
+            actor=actor,
+            input_messages=request.messages,
+            stream_steps=True,
+            stream_tokens=request.stream_tokens,
+            # Support for AssistantMessage
+            use_assistant_message=request.use_assistant_message,
+            assistant_message_tool_name=request.assistant_message_tool_name,
+            assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
+            request_start_timestamp_ns=request_start_timestamp_ns,
+        )
+
     return result
 
 
@@ -626,18 +732,17 @@ async def process_message_background(
     server: SyncServer,
     actor: User,
     agent_id: str,
-    messages: list,
+    messages: List[MessageCreate],
     use_assistant_message: bool,
     assistant_message_tool_name: str,
     assistant_message_tool_kwarg: str,
 ) -> None:
     """Background task to process the message and update job status."""
     try:
-        # TODO(matt) we should probably make this stream_steps and log each step as it progresses, so the job update GET can see the total steps so far + partial usage?
         result = await server.send_message_to_agent(
             agent_id=agent_id,
             actor=actor,
-            messages=messages,
+            input_messages=messages,
             stream_steps=False,  # NOTE(matt)
             stream_tokens=False,
             use_assistant_message=use_assistant_message,
@@ -649,8 +754,8 @@ async def process_message_background(
         # Update job status to completed
         job_update = JobUpdate(
             status=JobStatus.completed,
-            completed_at=datetime.utcnow(),
-            metadata={"result": result.model_dump()},  # Store the result in metadata
+            completed_at=datetime.now(timezone.utc),
+            metadata={"result": result.model_dump(mode="json")},  # Store the result in metadata
         )
         server.job_manager.update_job_by_id(job_id=job_id, job_update=job_update, actor=actor)
 
@@ -658,7 +763,7 @@ async def process_message_background(
         # Update job status to failed
         job_update = JobUpdate(
             status=JobStatus.failed,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(timezone.utc),
             metadata={"error": str(e)},
         )
         server.job_manager.update_job_by_id(job_id=job_id, job_update=job_update, actor=actor)
@@ -681,7 +786,7 @@ async def send_message_async(
     Asynchronously process a user message and return a run object.
     The actual processing happens in the background, and the status can be checked using the run ID.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     # Create a new job
     run = Run(
@@ -725,3 +830,16 @@ def reset_messages(
     """Resets the messages for an agent"""
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
     return server.agent_manager.reset_messages(agent_id=agent_id, actor=actor, add_default_initial_messages=add_default_initial_messages)
+
+
+@router.get("/{agent_id}/groups", response_model=List[Group], operation_id="list_agent_groups")
+async def list_agent_groups(
+    agent_id: str,
+    manager_type: Optional[str] = Query(None, description="Manager type to filter groups by"),
+    server: "SyncServer" = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
+):
+    """Lists the groups for an agent"""
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    print("in list agents with manager_type", manager_type)
+    return server.agent_manager.list_groups(agent_id=agent_id, manager_type=manager_type, actor=actor)

@@ -1,6 +1,6 @@
 import json
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 # Avoid circular imports
 if TYPE_CHECKING:
@@ -10,6 +10,10 @@ if TYPE_CHECKING:
 class ErrorCode(Enum):
     """Enum for error codes used by client."""
 
+    NOT_FOUND = "NOT_FOUND"
+    UNAUTHENTICATED = "UNAUTHENTICATED"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    INVALID_ARGUMENT = "INVALID_ARGUMENT"
     INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR"
     CONTEXT_WINDOW_EXCEEDED = "CONTEXT_WINDOW_EXCEEDED"
     RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
@@ -18,7 +22,9 @@ class ErrorCode(Enum):
 class LettaError(Exception):
     """Base class for all Letta related errors."""
 
-    def __init__(self, message: str, code: Optional[ErrorCode] = None, details: dict = {}):
+    def __init__(self, message: str, code: Optional[ErrorCode] = None, details: Optional[Union[Dict, str, object]] = None):
+        if details is None:
+            details = {}
         self.message = message
         self.code = code
         self.details = details
@@ -60,6 +66,39 @@ class LettaUserNotFoundError(LettaError):
 
 class LLMError(LettaError):
     pass
+
+
+class LLMConnectionError(LLMError):
+    """Error when unable to connect to LLM service"""
+
+
+class LLMRateLimitError(LLMError):
+    """Error when rate limited by LLM service"""
+
+
+class LLMBadRequestError(LLMError):
+    """Error when LLM service cannot process request"""
+
+
+class LLMAuthenticationError(LLMError):
+    """Error when authentication fails with LLM service"""
+
+
+class LLMPermissionDeniedError(LLMError):
+    """Error when permission is denied by LLM service"""
+
+
+class LLMNotFoundError(LLMError):
+    """Error when requested resource is not found"""
+
+
+class LLMUnprocessableEntityError(LLMError):
+    """Error when request is well-formed but semantically invalid"""
+
+
+class LLMServerError(LLMError):
+    """Error indicating an internal server error occurred within the LLM service itself
+    while processing the request."""
 
 
 class BedrockPermissionError(LettaError):
@@ -165,3 +204,13 @@ class InvalidInnerMonologueError(LettaMessageError):
     """Error raised when a message has a malformed inner monologue."""
 
     default_error_message = "The message has a malformed inner monologue."
+
+
+class HandleNotFoundError(LettaError):
+    """Error raised when a handle is not found."""
+
+    def __init__(self, handle: str, available_handles: List[str]):
+        super().__init__(
+            message=f"Handle {handle} not found, must be one of {available_handles}",
+            code=ErrorCode.NOT_FOUND,
+        )
