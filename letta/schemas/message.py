@@ -1442,7 +1442,7 @@ class Message(BaseMessage):
         native_content: bool = False,
         strip_request_heartbeat: bool = False,
     ) -> List[dict]:
-        messages = [m for m in messages if m is not None]
+        messages = Message.filter_messages_for_llm_api(messages)
         result = [
             m.to_anthropic_dict(
                 current_model=current_model,
@@ -1696,14 +1696,6 @@ class Message(BaseMessage):
 
         # Filter last message if it is a lone approval request without a response - this only occurs for token counting
         if messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
-            messages.remove(messages[-1])
-
-        # Filter last message if it is a lone reasoning message without assistant message or tool call
-        if (
-            messages[-1].role == "assistant"
-            and messages[-1].tool_calls is None
-            and (not messages[-1].content or all(not isinstance(content_part, TextContent) for content_part in messages[-1].content))
-        ):
             messages.remove(messages[-1])
 
         return messages
