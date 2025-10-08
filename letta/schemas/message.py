@@ -965,7 +965,13 @@ class Message(BaseMessage):
             }
 
         elif self.role == "assistant" or self.role == "approval":
-            assert self.tool_calls is not None or text_content is not None, vars(self)
+            try:
+                assert self.tool_calls is not None or text_content is not None, vars(self)
+            except AssertionError as e:
+                # relax check if this message only contains reasoning content
+                if self.content is not None and len(self.content) > 0 and isinstance(self.content[0], ReasoningContent):
+                    return None
+                raise e
 
             # if native content, then put it directly inside the content
             if native_content:
@@ -1040,6 +1046,7 @@ class Message(BaseMessage):
         put_inner_thoughts_in_kwargs: bool = False,
         use_developer_message: bool = False,
     ) -> List[dict]:
+        messages = Message.filter_messages_for_llm_api(messages)
         result = [
             m.to_openai_dict(
                 max_tool_id_length=max_tool_id_length,
@@ -1149,6 +1156,7 @@ class Message(BaseMessage):
         messages: List[Message],
         max_tool_id_length: int = TOOL_CALL_ID_MAX_LEN,
     ) -> List[dict]:
+        messages = Message.filter_messages_for_llm_api(messages)
         result = []
         for message in messages:
             result.extend(message.to_openai_responses_dicts(max_tool_id_length=max_tool_id_length))
@@ -1156,6 +1164,7 @@ class Message(BaseMessage):
 
     def to_anthropic_dict(
         self,
+        current_model: str,
         inner_thoughts_xml_tag="thinking",
         put_inner_thoughts_in_kwargs: bool = False,
         # if true, then treat the content field as AssistantMessage
@@ -1242,20 +1251,22 @@ class Message(BaseMessage):
                     for content_part in self.content:
                         # TextContent, ImageContent, ToolCallContent, ToolReturnContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent
                         if isinstance(content_part, ReasoningContent):
-                            content.append(
-                                {
-                                    "type": "thinking",
-                                    "thinking": content_part.reasoning,
-                                    "signature": content_part.signature,
-                                }
-                            )
+                            if current_model == self.model:
+                                content.append(
+                                    {
+                                        "type": "thinking",
+                                        "thinking": content_part.reasoning,
+                                        "signature": content_part.signature,
+                                    }
+                                )
                         elif isinstance(content_part, RedactedReasoningContent):
-                            content.append(
-                                {
-                                    "type": "redacted_thinking",
-                                    "data": content_part.data,
-                                }
-                            )
+                            if current_model == self.model:
+                                content.append(
+                                    {
+                                        "type": "redacted_thinking",
+                                        "data": content_part.data,
+                                    }
+                                )
                         elif isinstance(content_part, TextContent):
                             content.append(
                                 {
@@ -1272,20 +1283,22 @@ class Message(BaseMessage):
                 if self.content is not None and len(self.content) >= 1:
                     for content_part in self.content:
                         if isinstance(content_part, ReasoningContent):
-                            content.append(
-                                {
-                                    "type": "thinking",
-                                    "thinking": content_part.reasoning,
-                                    "signature": content_part.signature,
-                                }
-                            )
+                            if current_model == self.model:
+                                content.append(
+                                    {
+                                        "type": "thinking",
+                                        "thinking": content_part.reasoning,
+                                        "signature": content_part.signature,
+                                    }
+                                )
                         if isinstance(content_part, RedactedReasoningContent):
-                            content.append(
-                                {
-                                    "type": "redacted_thinking",
-                                    "data": content_part.data,
-                                }
-                            )
+                            if current_model == self.model:
+                                content.append(
+                                    {
+                                        "type": "redacted_thinking",
+                                        "data": content_part.data,
+                                    }
+                                )
                         if isinstance(content_part, TextContent):
                             content.append(
                                 {
@@ -1349,14 +1362,17 @@ class Message(BaseMessage):
     @staticmethod
     def to_anthropic_dicts_from_list(
         messages: List[Message],
+        current_model: str,
         inner_thoughts_xml_tag: str = "thinking",
         put_inner_thoughts_in_kwargs: bool = False,
         # if true, then treat the content field as AssistantMessage
         native_content: bool = False,
         strip_request_heartbeat: bool = False,
     ) -> List[dict]:
+        messages = Message.filter_messages_for_llm_api(messages)
         result = [
             m.to_anthropic_dict(
+                current_model=current_model,
                 inner_thoughts_xml_tag=inner_thoughts_xml_tag,
                 put_inner_thoughts_in_kwargs=put_inner_thoughts_in_kwargs,
                 native_content=native_content,
@@ -1369,6 +1385,7 @@ class Message(BaseMessage):
 
     def to_google_dict(
         self,
+        current_model: str,
         put_inner_thoughts_in_kwargs: bool = True,
         # if true, then treat the content field as AssistantMessage
         native_content: bool = False,
@@ -1484,11 +1501,12 @@ class Message(BaseMessage):
                 for content in self.content:
                     if isinstance(content, TextContent):
                         native_part = {"text": content.text}
-                        if content.signature:
+                        if content.signature and current_model == self.model:
                             native_part["thought_signature"] = content.signature
                         native_google_content_parts.append(native_part)
                     elif isinstance(content, ReasoningContent):
-                        native_google_content_parts.append({"text": content.reasoning, "thought": True})
+                        if current_model == self.model:
+                            native_google_content_parts.append({"text": content.reasoning, "thought": True})
                     elif isinstance(content, ToolCallContent):
                         native_part = {
                             "function_call": {
@@ -1496,7 +1514,7 @@ class Message(BaseMessage):
                                 "args": content.input,
                             },
                         }
-                        if content.signature:
+                        if content.signature and current_model == self.model:
                             native_part["thought_signature"] = content.signature
                         native_google_content_parts.append(native_part)
                     else:
@@ -1554,11 +1572,14 @@ class Message(BaseMessage):
     @staticmethod
     def to_google_dicts_from_list(
         messages: List[Message],
+        current_model: str,
         put_inner_thoughts_in_kwargs: bool = True,
         native_content: bool = False,
     ):
+        messages = Message.filter_messages_for_llm_api(messages)
         result = [
             m.to_google_dict(
+                current_model=current_model,
                 put_inner_thoughts_in_kwargs=put_inner_thoughts_in_kwargs,
                 native_content=native_content,
             )
@@ -1566,6 +1587,45 @@ class Message(BaseMessage):
         ]
         result = [m for m in result if m is not None]
         return result
+
+    def is_approval_request(self) -> bool:
+        return self.role == "approval" and self.tool_calls is not None and len(self.tool_calls) > 0
+
+    def is_approval_response(self) -> bool:
+        return self.role == "approval" and self.tool_calls is None and self.approve is not None
+
+    def is_summarization_message(self) -> bool:
+        return (
+            self.role == "user"
+            and self.content is not None
+            and len(self.content) == 1
+            and isinstance(self.content[0], TextContent)
+            and "system_alert" in self.content[0].text
+        )
+
+    @staticmethod
+    def filter_messages_for_llm_api(
+        messages: List[Message],
+    ) -> List[Message]:
+        messages = [m for m in messages if m is not None]
+        if len(messages) == 0:
+            return []
+        # Add special handling for legacy bug where summarization triggers in the middle of hitl
+        messages_to_filter = []
+        for i in range(len(messages) - 1):
+            first_message_is_approval = messages[i].is_approval_request()
+            second_message_is_summary = messages[i + 1].is_summarization_message()
+            third_message_is_optional_approval = i + 2 >= len(messages) or messages[i + 2].is_approval_response()
+            if first_message_is_approval and second_message_is_summary and third_message_is_optional_approval:
+                messages_to_filter.append(messages[i])
+        for idx in reversed(messages_to_filter):  # reverse to avoid index shift
+            messages.remove(idx)
+
+        # Filter last message if it is a lone approval request without a response - this only occurs for token counting
+        if messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
+            messages.remove(messages[-1])
+
+        return messages
 
     @staticmethod
     def generate_otid_from_id(message_id: str, index: int) -> str:
