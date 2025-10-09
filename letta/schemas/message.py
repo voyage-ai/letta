@@ -492,13 +492,60 @@ class Message(BaseMessage):
         assistant_message_tool_kwarg: str = DEFAULT_MESSAGE_TOOL_KWARG,
     ) -> List[LettaMessage]:
         messages = []
-        # This is type FunctionCall
+
+        # If assistant mode is off, just create one ToolCallMessage with all tool calls
+        if not use_assistant_message:
+            all_tool_call_objs = [
+                ToolCall(
+                    name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                    tool_call_id=tool_call.id,
+                )
+                for tool_call in self.tool_calls
+            ]
+
+            if all_tool_call_objs:
+                otid = Message.generate_otid_from_id(self.id, current_message_count)
+                messages.append(
+                    ToolCallMessage(
+                        id=self.id,
+                        date=self.created_at,
+                        # use first tool call for the deprecated field
+                        tool_call=all_tool_call_objs[0],
+                        tool_calls=all_tool_call_objs,
+                        name=self.name,
+                        otid=otid,
+                        sender_id=self.sender_id,
+                        step_id=self.step_id,
+                        is_err=self.is_err,
+                        run_id=self.run_id,
+                    )
+                )
+            return messages
+
+        collected_tool_calls = []
+
         for tool_call in self.tool_calls:
             otid = Message.generate_otid_from_id(self.id, current_message_count + len(messages))
-            # If we're supporting using assistant message,
-            # then we want to treat certain function calls as a special case
-            if use_assistant_message and tool_call.function.name == assistant_message_tool_name:
-                # We need to unpack the actual message contents from the function call
+
+            if tool_call.function.name == assistant_message_tool_name:
+                if collected_tool_calls:
+                    tool_call_message = ToolCallMessage(
+                        id=self.id,
+                        date=self.created_at,
+                        # use first tool call for the deprecated field
+                        tool_call=collected_tool_calls[0],
+                        tool_calls=collected_tool_calls.copy(),
+                        name=self.name,
+                        otid=Message.generate_otid_from_id(self.id, current_message_count + len(messages)),
+                        sender_id=self.sender_id,
+                        step_id=self.step_id,
+                        is_err=self.is_err,
+                        run_id=self.run_id,
+                    )
+                    messages.append(tool_call_message)
+                    collected_tool_calls = []  # reset the collection
+
                 try:
                     func_args = parse_json(tool_call.function.arguments)
                     message_string = validate_function_response(func_args[assistant_message_tool_kwarg], 0, truncate=False)
@@ -518,23 +565,31 @@ class Message(BaseMessage):
                     )
                 )
             else:
-                messages.append(
-                    ToolCallMessage(
-                        id=self.id,
-                        date=self.created_at,
-                        tool_call=ToolCall(
-                            name=tool_call.function.name,
-                            arguments=tool_call.function.arguments,
-                            tool_call_id=tool_call.id,
-                        ),
-                        name=self.name,
-                        otid=otid,
-                        sender_id=self.sender_id,
-                        step_id=self.step_id,
-                        is_err=self.is_err,
-                        run_id=self.run_id,
-                    )
+                # non-assistant tool call, collect it
+                tool_call_obj = ToolCall(
+                    name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                    tool_call_id=tool_call.id,
                 )
+                collected_tool_calls.append(tool_call_obj)
+
+        # flush any remaining collected tool calls
+        if collected_tool_calls:
+            tool_call_message = ToolCallMessage(
+                id=self.id,
+                date=self.created_at,
+                # use first tool call for the deprecated field
+                tool_call=collected_tool_calls[0],
+                tool_calls=collected_tool_calls,
+                name=self.name,
+                otid=Message.generate_otid_from_id(self.id, current_message_count + len(messages)),
+                sender_id=self.sender_id,
+                step_id=self.step_id,
+                is_err=self.is_err,
+                run_id=self.run_id,
+            )
+            messages.append(tool_call_message)
+
         return messages
 
     def _convert_tool_return_message(self) -> List[ToolReturnMessage]:
@@ -555,6 +610,13 @@ class Message(BaseMessage):
         """
         if self.role != MessageRole.tool:
             raise ValueError(f"Cannot convert message of type {self.role} to ToolReturnMessage")
+
+        # This is a very special buggy case during the double writing period
+        # where there is no tool call id on the tool return object, but it exists top level
+        # This is meant to be a short term patch - this can happen when people are using old agent files that were exported
+        # during a specific migration state
+        if len(self.tool_returns) == 1 and self.tool_call_id and not self.tool_returns[0].tool_call_id:
+            self.tool_returns[0].tool_call_id = self.tool_call_id
 
         if self.tool_returns:
             return self._convert_explicit_tool_returns()
@@ -647,6 +709,16 @@ class Message(BaseMessage):
         Returns:
             Configured ToolReturnMessage instance
         """
+        from letta.schemas.letta_message import ToolReturn as ToolReturnSchema
+
+        tool_return_obj = ToolReturnSchema(
+            tool_return=message_text,
+            status=status,
+            tool_call_id=tool_call_id,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
         return ToolReturnMessage(
             id=self.id,
             date=self.created_at,
@@ -655,6 +727,7 @@ class Message(BaseMessage):
             tool_call_id=tool_call_id,
             stdout=stdout,
             stderr=stderr,
+            tool_returns=[tool_return_obj],
             name=self.name,
             otid=Message.generate_otid_from_id(self.id, otid_index),
             sender_id=self.sender_id,
@@ -1623,6 +1696,14 @@ class Message(BaseMessage):
 
         # Filter last message if it is a lone approval request without a response - this only occurs for token counting
         if messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
+            messages.remove(messages[-1])
+
+        # Filter last message if it is a lone reasoning message without assistant message or tool call
+        if (
+            messages[-1].role == "assistant"
+            and messages[-1].tool_calls is None
+            and (not messages[-1].content or all(not isinstance(content_part, TextContent) for content_part in messages[-1].content))
+        ):
             messages.remove(messages[-1])
 
         return messages
