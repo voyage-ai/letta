@@ -33,8 +33,6 @@ LETTA_TOOL_MODULE_NAMES = [
 DEFAULT_ORG_ID = "org-00000000-0000-4000-8000-000000000000"
 DEFAULT_ORG_NAME = "default_org"
 
-AGENT_ID_PATTERN = re.compile(r"^agent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
-
 # String in the error message for when the context window is too large
 # Example full message:
 # This model's maximum context length is 8192 tokens. However, your messages resulted in 8198 tokens (7450 in the messages, 748 in the functions). Please reduce the length of the messages or functions.
@@ -127,10 +125,10 @@ LOCAL_ONLY_MULTI_AGENT_TOOLS = ["send_message_to_agent_async"]
 
 # Used to catch if line numbers are pushed in
 # MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX = re.compile(r"^Line \d+: ", re.MULTILINE)
-# More "robust" version that handles different kinds of whitespace
+# Updated to match new arrow format: "1→ content"
 # shared constant for both memory_insert and memory_replace
 MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX = re.compile(
-    r"^[ \t]*Line[ \t]+\d+[ \t]*:",  # allow any leading whitespace and flexible spacing
+    r"^[ \t]*\d+→[ \t]*",  # match number followed by arrow, with optional whitespace
     re.MULTILINE,
 )
 
@@ -156,6 +154,16 @@ LETTA_TOOL_SET = set(
     + BUILTIN_TOOLS
     + FILES_TOOLS
 )
+
+LETTA_PARALLEL_SAFE_TOOLS = {
+    "conversation_search",
+    "archival_memory_search",
+    "run_code",
+    "web_search",
+    "fetch_webpage",
+    "grep_files",
+    "semantic_search_files",
+}
 
 
 def FUNCTION_RETURN_VALUE_TRUNCATED(return_str, return_char: int, return_char_limit: int):
@@ -202,9 +210,7 @@ ERROR_MESSAGE_PREFIX = "Error"
 
 NON_USER_MSG_PREFIX = "[This is an automated system message hidden from the user] "
 
-CORE_MEMORY_LINE_NUMBER_WARNING = (
-    "# NOTE: Line numbers shown below are to help during editing. Do NOT include line number prefixes in your memory edit tool calls."
-)
+CORE_MEMORY_LINE_NUMBER_WARNING = "# NOTE: Line numbers shown below (with arrows like '1→') are to help during editing. Do NOT include line number prefixes in your memory edit tool calls."
 
 
 # Constants to do with summarization / conversation length window
@@ -318,6 +324,23 @@ LLM_MAX_TOKENS = {
     "gemini-2.0-flash-thinking-exp-1219": 1048576,
     "gemini-2.5-flash-preview-tts": 32768,
     "gemini-2.5-pro-preview-tts": 65536,
+    # gemini 2.5 stable releases
+    "gemini-2.5-flash": 1048576,
+    "gemini-2.5-flash-lite": 1048576,
+    "gemini-2.5-pro": 1048576,
+    "gemini-2.5-pro-preview-06-05": 1048576,
+    "gemini-2.5-flash-lite-preview-06-17": 1048576,
+    "gemini-2.5-flash-image": 1048576,
+    "gemini-2.5-flash-image-preview": 1048576,
+    "gemini-2.5-flash-preview-09-2025": 1048576,
+    "gemini-2.5-flash-lite-preview-09-2025": 1048576,
+    "gemini-2.5-computer-use-preview-10-2025": 1048576,
+    # gemini latest aliases
+    "gemini-flash-latest": 1048576,
+    "gemini-flash-lite-latest": 1048576,
+    "gemini-pro-latest": 1048576,
+    # gemini specialized models
+    "gemini-robotics-er-1.5-preview": 1048576,
 }
 # The error message that Letta will receive
 # MESSAGE_SUMMARY_WARNING_STR = f"Warning: the conversation history will soon reach its maximum length and be trimmed. Make sure to save any important information from the conversation to your memory before it is removed."

@@ -11,6 +11,7 @@ from letta.constants import (
     LETTA_VOICE_TOOL_MODULE_NAME,
     MCP_TOOL_TAG_NAME_PREFIX,
 )
+from letta.schemas.enums import PrimitiveType
 
 # MCP Tool metadata constants for schema health status
 MCP_TOOL_METADATA_SCHEMA_STATUS = f"{MCP_TOOL_TAG_NAME_PREFIX}:SCHEMA_STATUS"
@@ -28,7 +29,7 @@ logger = get_logger(__name__)
 
 
 class BaseTool(LettaBase):
-    __id_prefix__ = "tool"
+    __id_prefix__ = PrimitiveType.TOOL.value
 
 
 class Tool(BaseTool):
@@ -62,6 +63,9 @@ class Tool(BaseTool):
     npm_requirements: list[NpmRequirement] | None = Field(None, description="Optional list of npm packages required by this tool.")
     default_requires_approval: Optional[bool] = Field(
         None, description="Default value for whether or not executing this tool requires approval."
+    )
+    enable_parallel_execution: Optional[bool] = Field(
+        False, description="If set to True, then this tool will potentially be executed concurrently with other tools. Default False."
     )
 
     # metadata fields
@@ -118,6 +122,9 @@ class ToolCreate(LettaBase):
     pip_requirements: list[PipRequirement] | None = Field(None, description="Optional list of pip packages required by this tool.")
     npm_requirements: list[NpmRequirement] | None = Field(None, description="Optional list of npm packages required by this tool.")
     default_requires_approval: Optional[bool] = Field(None, description="Whether or not to require approval before executing this tool.")
+    enable_parallel_execution: Optional[bool] = Field(
+        False, description="If set to True, then this tool will potentially be executed concurrently with other tools. Default False."
+    )
 
     @classmethod
     def from_mcp(cls, mcp_server_name: str, mcp_tool: MCPTool) -> "ToolCreate":
@@ -145,6 +152,19 @@ class ToolCreate(LettaBase):
             json_schema=json_schema,
         )
 
+    def model_dump(self, to_orm: bool = False, **kwargs):
+        """
+        Override LettaBase.model_dump to explicitly handle 'tags' being None,
+        ensuring that the output includes 'tags' as None (or any current value).
+        """
+        data = super().model_dump(**kwargs)
+        # TODO: consider making tags itself optional in the ORM
+        # Ensure 'tags' is included even when None, but only if tags is in the dict
+        # (i.e., don't add tags if exclude_unset=True was used and tags wasn't set)
+        if "tags" in data and data["tags"] is None:
+            data["tags"] = []
+        return data
+
 
 class ToolUpdate(LettaBase):
     description: Optional[str] = Field(None, description="The description of the tool.")
@@ -160,6 +180,9 @@ class ToolUpdate(LettaBase):
     npm_requirements: list[NpmRequirement] | None = Field(None, description="Optional list of npm packages required by this tool.")
     metadata_: Optional[Dict[str, Any]] = Field(None, description="A dictionary of additional metadata for the tool.")
     default_requires_approval: Optional[bool] = Field(None, description="Whether or not to require approval before executing this tool.")
+    enable_parallel_execution: Optional[bool] = Field(
+        False, description="If set to True, then this tool will potentially be executed concurrently with other tools. Default False."
+    )
     # name: Optional[str] = Field(None, description="The name of the tool (must match the JSON schema name and source code function name).")
 
     model_config = ConfigDict(extra="ignore")  # Allows extra fields without validation errors

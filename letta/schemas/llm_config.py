@@ -13,6 +13,8 @@ class LLMConfig(BaseModel):
     """Configuration for Language Model (LLM) connection and generation parameters."""
 
     model: str = Field(..., description="LLM model name. ")
+    display_name: Optional[str] = Field(None, description="A human-friendly display name for the model.")
+
     model_endpoint_type: Literal[
         "openai",
         "anthropic",
@@ -78,6 +80,7 @@ class LLMConfig(BaseModel):
 
     # FIXME hack to silence pydantic protected namespace warning
     model_config = ConfigDict(protected_namespaces=())
+    parallel_tool_calls: Optional[bool] = Field(False, description="If set to True, enables parallel tool calling. Defaults to False.")
 
     @model_validator(mode="before")
     @classmethod
@@ -151,7 +154,10 @@ class LLMConfig(BaseModel):
             values["put_inner_thoughts_in_kwargs"] = False
 
         if values.get("model_endpoint_type") == "anthropic" and (
-            model.startswith("claude-3-7-sonnet") or model.startswith("claude-sonnet-4") or model.startswith("claude-opus-4")
+            model.startswith("claude-3-7-sonnet")
+            or model.startswith("claude-sonnet-4")
+            or model.startswith("claude-opus-4")
+            or model.startswith("claude-haiku-4-5")
         ):
             values["put_inner_thoughts_in_kwargs"] = False
 
@@ -239,7 +245,7 @@ class LLMConfig(BaseModel):
             config.model.startswith("claude-opus-4")
             or config.model.startswith("claude-sonnet-4")
             or config.model.startswith("claude-3-7-sonnet")
-            or config.model.startswith("claude-4-5-haiku")
+            or config.model.startswith("claude-haiku-4-5")
         )
 
     @classmethod

@@ -25,6 +25,7 @@ from letta.orm.errors import NoResultFound
 from letta.orm.mcp_oauth import MCPOAuth, OAuthSessionStatus
 from letta.orm.mcp_server import MCPServer as MCPServerModel
 from letta.orm.tool import Tool as ToolModel
+from letta.schemas.enums import PrimitiveType
 from letta.schemas.mcp import (
     MCPOAuthSession,
     MCPOAuthSessionCreate,
@@ -36,16 +37,18 @@ from letta.schemas.mcp import (
     UpdateStdioMCPServer,
     UpdateStreamableHTTPMCPServer,
 )
-from letta.schemas.secret import Secret, SecretDict
+from letta.schemas.secret import Secret
 from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
+from letta.services.mcp.base_client import AsyncBaseMCPClient
 from letta.services.mcp.sse_client import MCP_CONFIG_TOPLEVEL_KEY, AsyncSSEMCPClient
 from letta.services.mcp.stdio_client import AsyncStdioMCPClient
 from letta.services.mcp.streamable_http_client import AsyncStreamableHTTPMCPClient
 from letta.services.tool_manager import ToolManager
-from letta.settings import tool_settings
-from letta.utils import enforce_types, printd, safe_create_task
+from letta.settings import settings, tool_settings
+from letta.utils import enforce_types, printd, safe_create_task_with_return
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -59,6 +62,7 @@ class MCPManager:
         self.cached_mcp_servers = {}  # maps id -> async connection
 
     @enforce_types
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def list_mcp_server_tools(self, mcp_server_name: str, actor: PydanticUser, agent_id: Optional[str] = None) -> List[MCPTool]:
         """Get a list of all tools for a specific MCP server."""
         mcp_client = None
@@ -73,7 +77,7 @@ class MCPManager:
             tools = await mcp_client.list_tools()
             # Add health information to each tool
             for tool in tools:
-                # Try to normalize the schema and re-validate\
+                # Try to normalize the schema and re-validate
                 if tool.inputSchema:
                     tool.inputSchema = normalize_mcp_schema(tool.inputSchema)
                     health_status, reasons = validate_complete_json_schema(tool.inputSchema)
@@ -174,10 +178,7 @@ class MCPManager:
 
                 # After normalization attempt, check if still INVALID
                 if mcp_tool.health and mcp_tool.health.status == "INVALID":
-                    raise ValueError(
-                        f"Tool {mcp_tool_name} cannot be attached, JSON schema is invalid even after normalization. "
-                        f"Reasons: {', '.join(mcp_tool.health.reasons)}"
-                    )
+                    logger.warning(f"Tool {mcp_tool_name} has potentially invalid schema. Reasons: {', '.join(mcp_tool.health.reasons)}")
 
                 tool_create = ToolCreate.from_mcp(mcp_server_name=mcp_server_name, mcp_tool=mcp_tool)
                 return await self.tool_manager.create_mcp_tool_async(
@@ -318,6 +319,7 @@ class MCPManager:
             update_data = pydantic_mcp_server.model_dump(exclude_unset=True, exclude_none=True)
 
             # If there's anything to update (can only update the configs, not the name)
+            # TODO: pass in custom headers for update as well?
             if update_data:
                 if pydantic_mcp_server.server_type == MCPServerType.SSE:
                     update_request = UpdateSSEMCPServer(server_url=pydantic_mcp_server.server_url, token=pydantic_mcp_server.token)
@@ -325,7 +327,7 @@ class MCPManager:
                     update_request = UpdateStdioMCPServer(stdio_config=pydantic_mcp_server.stdio_config)
                 elif pydantic_mcp_server.server_type == MCPServerType.STREAMABLE_HTTP:
                     update_request = UpdateStreamableHTTPMCPServer(
-                        server_url=pydantic_mcp_server.server_url, token=pydantic_mcp_server.token
+                        server_url=pydantic_mcp_server.server_url, auth_token=pydantic_mcp_server.token
                     )
                 else:
                     raise ValueError(f"Unsupported server type: {pydantic_mcp_server.server_type}")
@@ -347,6 +349,17 @@ class MCPManager:
             try:
                 # Set the organization id at the ORM layer
                 pydantic_mcp_server.organization_id = actor.organization_id
+
+                # Explicitly populate encrypted fields
+                if pydantic_mcp_server.token is not None:
+                    pydantic_mcp_server.token_enc = Secret.from_plaintext(pydantic_mcp_server.token)
+                if pydantic_mcp_server.custom_headers is not None:
+                    # custom_headers is a Dict[str, str], serialize to JSON then encrypt
+                    import json
+
+                    json_str = json.dumps(pydantic_mcp_server.custom_headers)
+                    pydantic_mcp_server.custom_headers_enc = Secret.from_plaintext(json_str)
+
                 mcp_server_data = pydantic_mcp_server.model_dump(to_orm=True)
 
                 # Ensure custom_headers None is stored as SQL NULL, not JSON null
@@ -384,7 +397,6 @@ class MCPManager:
                 return mcp_server.to_pydantic()
             except Exception as e:
                 await session.rollback()
-                logger.error(f"Failed to create MCP server: {e}")
                 raise
 
     @enforce_types
@@ -412,7 +424,9 @@ class MCPManager:
                 token_secret = Secret.from_plaintext(token)
                 mcp_server.set_token_secret(token_secret)
             if server_config.custom_headers:
-                headers_secret = SecretDict.from_plaintext(server_config.custom_headers)
+                # Convert dict to JSON string, then encrypt as Secret
+                headers_json = json.dumps(server_config.custom_headers)
+                headers_secret = Secret.from_plaintext(headers_json)
                 mcp_server.set_custom_headers_secret(headers_secret)
 
         elif isinstance(server_config, StreamableHTTPServerConfig):
@@ -427,7 +441,9 @@ class MCPManager:
                 token_secret = Secret.from_plaintext(token)
                 mcp_server.set_token_secret(token_secret)
             if server_config.custom_headers:
-                headers_secret = SecretDict.from_plaintext(server_config.custom_headers)
+                # Convert dict to JSON string, then encrypt as Secret
+                headers_json = json.dumps(server_config.custom_headers)
+                headers_secret = Secret.from_plaintext(headers_json)
                 mcp_server.set_custom_headers_secret(headers_secret)
         else:
             raise ValueError(f"Unsupported server config type: {type(server_config)}")
@@ -517,27 +533,52 @@ class MCPManager:
             update_data = mcp_server_update.model_dump(to_orm=True, exclude_unset=True)
 
             # Handle encryption for token if provided
+            # Only re-encrypt if the value has actually changed
             if "token" in update_data and update_data["token"] is not None:
-                token_secret = Secret.from_plaintext(update_data["token"])
-                secret_dict = token_secret.to_dict()
-                update_data["token_enc"] = secret_dict["encrypted"]
-                # During migration phase, also update plaintext
-                if not token_secret._was_encrypted:
-                    update_data["token"] = secret_dict["plaintext"]
-                else:
-                    update_data["token"] = None
+                # Check if value changed
+                existing_token = None
+                if mcp_server.token_enc:
+                    existing_secret = Secret.from_encrypted(mcp_server.token_enc)
+                    existing_token = existing_secret.get_plaintext()
+                elif mcp_server.token:
+                    existing_token = mcp_server.token
+
+                # Only re-encrypt if different
+                if existing_token != update_data["token"]:
+                    mcp_server.token_enc = Secret.from_plaintext(update_data["token"]).get_encrypted()
+                    # Keep plaintext for dual-write during migration
+                    mcp_server.token = update_data["token"]
+
+                # Remove from update_data since we set directly on mcp_server
+                update_data.pop("token", None)
+                update_data.pop("token_enc", None)
 
             # Handle encryption for custom_headers if provided
+            # Only re-encrypt if the value has actually changed
             if "custom_headers" in update_data:
                 if update_data["custom_headers"] is not None:
-                    headers_secret = SecretDict.from_plaintext(update_data["custom_headers"])
-                    secret_dict = headers_secret.to_dict()
-                    update_data["custom_headers_enc"] = secret_dict["encrypted"]
-                    # During migration phase, also update plaintext
-                    if not headers_secret._was_encrypted:
-                        update_data["custom_headers"] = secret_dict["plaintext"]
-                    else:
-                        update_data["custom_headers"] = None
+                    # custom_headers is a Dict[str, str], serialize to JSON then encrypt
+                    import json
+
+                    json_str = json.dumps(update_data["custom_headers"])
+
+                    # Check if value changed
+                    existing_headers_json = None
+                    if mcp_server.custom_headers_enc:
+                        existing_secret = Secret.from_encrypted(mcp_server.custom_headers_enc)
+                        existing_headers_json = existing_secret.get_plaintext()
+                    elif mcp_server.custom_headers:
+                        existing_headers_json = json.dumps(mcp_server.custom_headers)
+
+                    # Only re-encrypt if different
+                    if existing_headers_json != json_str:
+                        mcp_server.custom_headers_enc = Secret.from_plaintext(json_str).get_encrypted()
+                        # Keep plaintext for dual-write during migration
+                        mcp_server.custom_headers = update_data["custom_headers"]
+
+                    # Remove from update_data since we set directly on mcp_server
+                    update_data.pop("custom_headers", None)
+                    update_data.pop("custom_headers_enc", None)
                 else:
                     # Ensure custom_headers None is stored as SQL NULL, not JSON null
                     update_data.pop("custom_headers", None)
@@ -758,7 +799,8 @@ class MCPManager:
         # If no OAuth provider is provided, check if we have stored OAuth credentials
         if oauth_provider is None and hasattr(server_config, "server_url"):
             oauth_session = await self.get_oauth_session_by_server(server_config.server_url, actor)
-            if oauth_session and oauth_session.access_token:
+            # Check if access token exists by attempting to decrypt it
+            if oauth_session and oauth_session.get_access_token_secret().get_plaintext():
                 # Create OAuth provider from stored credentials
                 from letta.services.mcp.oauth_utils import create_oauth_provider
 
@@ -787,8 +829,6 @@ class MCPManager:
         """
         Convert OAuth ORM model to Pydantic model, handling decryption of sensitive fields.
         """
-        from letta.settings import settings
-
         # Get decrypted values using the dual-read approach
         # Secret.from_db() will automatically use settings.encryption_key if available
         access_token = None
@@ -818,7 +858,17 @@ class MCPManager:
                 # No encryption key, use plaintext if available
                 client_secret = oauth_session.client_secret
 
-        return MCPOAuthSession(
+        authorization_code = None
+        if oauth_session.authorization_code_enc or oauth_session.authorization_code:
+            if settings.encryption_key:
+                secret = Secret.from_db(oauth_session.authorization_code_enc, oauth_session.authorization_code)
+                authorization_code = secret.get_plaintext()
+            else:
+                # No encryption key, use plaintext if available
+                authorization_code = oauth_session.authorization_code
+
+        # Create the Pydantic object with encrypted fields as Secret objects
+        pydantic_session = MCPOAuthSession(
             id=oauth_session.id,
             state=oauth_session.state,
             server_id=oauth_session.server_id,
@@ -827,7 +877,7 @@ class MCPManager:
             user_id=oauth_session.user_id,
             organization_id=oauth_session.organization_id,
             authorization_url=oauth_session.authorization_url,
-            authorization_code=oauth_session.authorization_code,
+            authorization_code=authorization_code,
             access_token=access_token,
             refresh_token=refresh_token,
             token_type=oauth_session.token_type,
@@ -839,7 +889,15 @@ class MCPManager:
             status=oauth_session.status,
             created_at=oauth_session.created_at,
             updated_at=oauth_session.updated_at,
+            # Encrypted fields as Secret objects (converted from encrypted strings in DB)
+            authorization_code_enc=Secret.from_encrypted(oauth_session.authorization_code_enc)
+            if oauth_session.authorization_code_enc
+            else None,
+            access_token_enc=Secret.from_encrypted(oauth_session.access_token_enc) if oauth_session.access_token_enc else None,
+            refresh_token_enc=Secret.from_encrypted(oauth_session.refresh_token_enc) if oauth_session.refresh_token_enc else None,
+            client_secret_enc=Secret.from_encrypted(oauth_session.client_secret_enc) if oauth_session.client_secret_enc else None,
         )
+        return pydantic_session
 
     @enforce_types
     async def create_oauth_session(self, session_create: MCPOAuthSessionCreate, actor: PydanticUser) -> MCPOAuthSession:
@@ -905,38 +963,57 @@ class MCPManager:
             # Update fields that are provided
             if session_update.authorization_url is not None:
                 oauth_session.authorization_url = session_update.authorization_url
+
+            # Handle encryption for authorization_code
+            # Only re-encrypt if the value has actually changed
             if session_update.authorization_code is not None:
-                oauth_session.authorization_code = session_update.authorization_code
+                # Check if value changed
+                existing_code = None
+                if oauth_session.authorization_code_enc:
+                    existing_secret = Secret.from_encrypted(oauth_session.authorization_code_enc)
+                    existing_code = existing_secret.get_plaintext()
+                elif oauth_session.authorization_code:
+                    existing_code = oauth_session.authorization_code
+
+                # Only re-encrypt if different
+                if existing_code != session_update.authorization_code:
+                    oauth_session.authorization_code_enc = Secret.from_plaintext(session_update.authorization_code).get_encrypted()
+                    # Keep plaintext for dual-write during migration
+                    oauth_session.authorization_code = session_update.authorization_code
 
             # Handle encryption for access_token
+            # Only re-encrypt if the value has actually changed
             if session_update.access_token is not None:
-                from letta.settings import settings
+                # Check if value changed
+                existing_token = None
+                if oauth_session.access_token_enc:
+                    existing_secret = Secret.from_encrypted(oauth_session.access_token_enc)
+                    existing_token = existing_secret.get_plaintext()
+                elif oauth_session.access_token:
+                    existing_token = oauth_session.access_token
 
-                if settings.encryption_key:
-                    token_secret = Secret.from_plaintext(session_update.access_token)
-                    secret_dict = token_secret.to_dict()
-                    oauth_session.access_token_enc = secret_dict["encrypted"]
-                    # During migration phase, also update plaintext
-                    oauth_session.access_token = secret_dict["plaintext"] if not token_secret._was_encrypted else None
-                else:
-                    # No encryption, store plaintext
+                # Only re-encrypt if different
+                if existing_token != session_update.access_token:
+                    oauth_session.access_token_enc = Secret.from_plaintext(session_update.access_token).get_encrypted()
+                    # Keep plaintext for dual-write during migration
                     oauth_session.access_token = session_update.access_token
-                    oauth_session.access_token_enc = None
 
             # Handle encryption for refresh_token
+            # Only re-encrypt if the value has actually changed
             if session_update.refresh_token is not None:
-                from letta.settings import settings
+                # Check if value changed
+                existing_refresh = None
+                if oauth_session.refresh_token_enc:
+                    existing_secret = Secret.from_encrypted(oauth_session.refresh_token_enc)
+                    existing_refresh = existing_secret.get_plaintext()
+                elif oauth_session.refresh_token:
+                    existing_refresh = oauth_session.refresh_token
 
-                if settings.encryption_key:
-                    token_secret = Secret.from_plaintext(session_update.refresh_token)
-                    secret_dict = token_secret.to_dict()
-                    oauth_session.refresh_token_enc = secret_dict["encrypted"]
-                    # During migration phase, also update plaintext
-                    oauth_session.refresh_token = secret_dict["plaintext"] if not token_secret._was_encrypted else None
-                else:
-                    # No encryption, store plaintext
+                # Only re-encrypt if different
+                if existing_refresh != session_update.refresh_token:
+                    oauth_session.refresh_token_enc = Secret.from_plaintext(session_update.refresh_token).get_encrypted()
+                    # Keep plaintext for dual-write during migration
                     oauth_session.refresh_token = session_update.refresh_token
-                    oauth_session.refresh_token_enc = None
 
             if session_update.token_type is not None:
                 oauth_session.token_type = session_update.token_type
@@ -948,19 +1025,21 @@ class MCPManager:
                 oauth_session.client_id = session_update.client_id
 
             # Handle encryption for client_secret
+            # Only re-encrypt if the value has actually changed
             if session_update.client_secret is not None:
-                from letta.settings import settings
+                # Check if value changed
+                existing_secret_val = None
+                if oauth_session.client_secret_enc:
+                    existing_secret = Secret.from_encrypted(oauth_session.client_secret_enc)
+                    existing_secret_val = existing_secret.get_plaintext()
+                elif oauth_session.client_secret:
+                    existing_secret_val = oauth_session.client_secret
 
-                if settings.encryption_key:
-                    secret_secret = Secret.from_plaintext(session_update.client_secret)
-                    secret_dict = secret_secret.to_dict()
-                    oauth_session.client_secret_enc = secret_dict["encrypted"]
-                    # During migration phase, also update plaintext
-                    oauth_session.client_secret = secret_dict["plaintext"] if not secret_secret._was_encrypted else None
-                else:
-                    # No encryption, store plaintext
+                # Only re-encrypt if different
+                if existing_secret_val != session_update.client_secret:
+                    oauth_session.client_secret_enc = Secret.from_plaintext(session_update.client_secret).get_encrypted()
+                    # Keep plaintext for dual-write during migration
                     oauth_session.client_secret = session_update.client_secret
-                    oauth_session.client_secret_enc = None
 
             if session_update.redirect_uri is not None:
                 oauth_session.redirect_uri = session_update.redirect_uri
@@ -1073,18 +1152,37 @@ class MCPManager:
         # Get authorization URL by triggering OAuth flow
         temp_client = None
         connect_task = None
+
+        async def connect_and_cleanup(client: AsyncBaseMCPClient, ready_queue: asyncio.Queue):
+            """Wrap connection and cleanup in the same task to share cancel scope"""
+            try:
+                await client.connect_to_server()
+                # Send client to main task without finishing the task
+                await ready_queue.put(client)
+                # Now wait for signal to cleanup
+                await client._cleanup_event.wait()
+            finally:
+                await client.cleanup()
+
         try:
+            ready_queue = asyncio.Queue()
             temp_client = await self.get_mcp_client(request, actor, oauth_provider)
+            temp_client._cleanup_event = asyncio.Event()
 
             # Run connect_to_server in background to avoid blocking
             # This will trigger the OAuth flow and the redirect_handler will save the authorization URL to database
-            connect_task = safe_create_task(temp_client.connect_to_server(), label="mcp_oauth_connect")
-
-            # Give the OAuth flow time to trigger and save the URL
-            await asyncio.sleep(1.0)
+            connect_task = safe_create_task_with_return(connect_and_cleanup(temp_client, ready_queue), label="mcp_oauth_connect")
 
             # Fetch the authorization URL from database and yield state to client to proceed with handling authorization URL
             auth_session = await self.get_oauth_session_by_id(session_id, actor)
+
+            # Give the OAuth flow time to connect to the MCP server and store the authorization URL
+            timeout = 0
+            while not auth_session or not auth_session.authorization_url and not connect_task.done() and timeout < 10:
+                timeout += 1
+                auth_session = await self.get_oauth_session_by_id(session_id, actor)
+                await asyncio.sleep(1.0)
+
             if auth_session and auth_session.authorization_url:
                 yield oauth_stream_event(OauthStreamEvent.AUTHORIZATION_URL, url=auth_session.authorization_url, session_id=session_id)
 
@@ -1092,11 +1190,14 @@ class MCPManager:
             yield oauth_stream_event(OauthStreamEvent.WAITING_FOR_AUTH, message="Waiting for user authorization...")
 
             # Callback handler will poll for authorization code and state and update the OAuth session
-            await connect_task
-
+            # Get the client from the queue
+            temp_client = await ready_queue.get()
             tools = await temp_client.list_tools(serialize=True)
             yield oauth_stream_event(OauthStreamEvent.SUCCESS, tools=tools)
 
+            # Signal the background task to cleanup in its own task
+            temp_client._cleanup_event.set()
+            await connect_task  # now it finishes safely
         except Exception as e:
             logger.error(f"Error triggering OAuth flow: {e}")
             yield oauth_stream_event(OauthStreamEvent.ERROR, message=f"Failed to trigger OAuth: {str(e)}")
@@ -1109,8 +1210,3 @@ class MCPManager:
                     await connect_task
                 except asyncio.CancelledError:
                     pass
-            if temp_client:
-                try:
-                    await temp_client.cleanup()
-                except Exception as cleanup_error:
-                    logger.warning(f"Error during temp MCP client cleanup: {cleanup_error}")

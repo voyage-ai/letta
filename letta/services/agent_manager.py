@@ -25,6 +25,7 @@ from letta.constants import (
     INCLUDE_MODEL_KEYWORDS_BASE_TOOL_RULES,
     RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE,
 )
+from letta.errors import LettaAgentNotFoundError
 from letta.helpers import ToolRulesSolver
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.llm_api.llm_client import LLMClient
@@ -50,6 +51,7 @@ from letta.orm.sqlalchemy_base import AccessType
 from letta.otel.tracing import trace_method
 from letta.prompts.prompt_generator import PromptGenerator
 from letta.schemas.agent import (
+    AgentRelationships,
     AgentState as PydanticAgentState,
     CreateAgent,
     InternalTemplateAgentCreate,
@@ -57,13 +59,14 @@ from letta.schemas.agent import (
 )
 from letta.schemas.block import DEFAULT_BLOCKS, Block as PydanticBlock, BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.enums import AgentType, ProviderType, TagMatchMode, ToolType, VectorDBProvider
+from letta.schemas.enums import AgentType, PrimitiveType, ProviderType, TagMatchMode, ToolType, VectorDBProvider
 from letta.schemas.file import FileMetadata as PydanticFileMetadata
 from letta.schemas.group import Group as PydanticGroup, ManagerType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import ContextWindowOverview, Memory
 from letta.schemas.message import Message, Message as PydanticMessage, MessageCreate, MessageUpdate
 from letta.schemas.passage import Passage as PydanticPassage
+from letta.schemas.secret import Secret
 from letta.schemas.source import Source as PydanticSource
 from letta.schemas.tool import Tool as PydanticTool
 from letta.schemas.tool_rule import ContinueToolRule, RequiresApprovalToolRule, TerminalToolRule
@@ -106,8 +109,9 @@ from letta.services.message_manager import MessageManager
 from letta.services.passage_manager import PassageManager
 from letta.services.source_manager import SourceManager
 from letta.services.tool_manager import ToolManager
-from letta.settings import DatabaseChoice, settings
+from letta.settings import DatabaseChoice, model_settings, settings
 from letta.utils import calculate_file_defaults_based_on_context_window, enforce_types, united_diff
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -170,13 +174,20 @@ class AgentManager:
 
     @staticmethod
     async def _resolve_tools_async(
-        session, names: Set[str], ids: Set[str], org_id: str
+        session, names: Set[str], ids: Set[str], org_id: str, ignore_invalid_tools: bool = False
     ) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
         """
         Bulk‑fetch all ToolModel rows matching either name ∈ names or id ∈ ids
         (and scoped to this organization), and return two maps:
           name_to_id, id_to_name.
-        Raises if any requested name or id was not found.
+        Raises if any requested name or id was not found (unless ignore_invalid_tools is True).
+
+        Args:
+            session: Database session
+            names: Set of tool names to resolve
+            ids: Set of tool IDs to resolve
+            org_id: Organization ID for scoping
+            ignore_invalid_tools: If True, silently filters out missing tools instead of raising an error
         """
         stmt = select(ToolModel.id, ToolModel.name, ToolModel.default_requires_approval).where(
             ToolModel.organization_id == org_id,
@@ -193,10 +204,21 @@ class AgentManager:
 
         missing_names = names - set(name_to_id.keys())
         missing_ids = ids - set(id_to_name.keys())
-        if missing_names:
-            raise ValueError(f"Tools not found by name: {missing_names}")
-        if missing_ids:
-            raise ValueError(f"Tools not found by id:   {missing_ids}")
+
+        if not ignore_invalid_tools:
+            # Original behavior: raise errors for missing tools
+            if missing_names:
+                raise ValueError(f"Tools not found by name: {missing_names}")
+            if missing_ids:
+                raise ValueError(f"Tools not found by id:   {missing_ids}")
+        else:
+            # New behavior: log missing tools but don't raise errors
+            if missing_names or missing_ids:
+                logger = get_logger(__name__)
+                if missing_names:
+                    logger.warning(f"Ignoring tools not found by name: {missing_names}")
+                if missing_ids:
+                    logger.warning(f"Ignoring tools not found by id: {missing_ids}")
 
         return name_to_id, id_to_name, requires_approval
 
@@ -310,6 +332,7 @@ class AgentManager:
         actor: PydanticUser,
         _test_only_force_id: Optional[str] = None,
         _init_with_no_messages: bool = False,
+        ignore_invalid_tools: bool = False,
     ) -> PydanticAgentState:
         # validate required configs
         if not agent_create.llm_config or not agent_create.embedding_config:
@@ -378,6 +401,9 @@ class AgentManager:
                 # NOTE: also overwrite initial message sequence to empty by default
                 if agent_create.initial_message_sequence is None:
                     agent_create.initial_message_sequence = []
+                # NOTE: default to no base tool rules unless explicitly provided
+                if not agent_create.tool_rules and agent_create.include_base_tool_rules is None:
+                    agent_create.include_base_tool_rules = False
             elif agent_create.agent_type == AgentType.workflow_agent:
                 pass  # no default tools
             else:
@@ -416,6 +442,7 @@ class AgentManager:
                     tool_names,
                     supplied_ids,
                     actor.organization_id,
+                    ignore_invalid_tools=ignore_invalid_tools,
                 )
 
                 tool_ids = set(name_to_id.values()) | set(id_to_name.keys())
@@ -521,16 +548,22 @@ class AgentManager:
 
                 env_rows = []
                 agent_secrets = agent_create.secrets or agent_create.tool_exec_environment_variables
+
                 if agent_secrets:
-                    env_rows = [
-                        {
+                    # Encrypt environment variable values
+                    env_rows = []
+                    for key, val in agent_secrets.items():
+                        row = {
                             "agent_id": aid,
                             "key": key,
                             "value": val,
                             "organization_id": actor.organization_id,
                         }
-                        for key, val in agent_secrets.items()
-                    ]
+                        # Encrypt value (Secret.from_plaintext handles missing encryption key internally)
+                        value_secret = Secret.from_plaintext(val)
+                        row["value_enc"] = value_secret.get_encrypted()
+                        env_rows.append(row)
+
                     result = await session.execute(insert(AgentEnvironmentVariable).values(env_rows).returning(AgentEnvironmentVariable.id))
                     env_rows = [{**row, "id": env_var_id} for row, env_var_id in zip(env_rows, result.scalars().all())]
 
@@ -640,6 +673,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def update_agent_async(
         self,
         agent_id: str,
@@ -742,16 +776,44 @@ class AgentManager:
 
             agent_secrets = agent_update.secrets or agent_update.tool_exec_environment_variables
             if agent_secrets is not None:
+                # Fetch existing environment variables to check if values changed
+                result = await session.execute(select(AgentEnvironmentVariable).where(AgentEnvironmentVariable.agent_id == aid))
+                existing_env_vars = {env.key: env for env in result.scalars().all()}
+
+                # TODO: do we need to delete each time or can we just upsert?
                 await session.execute(delete(AgentEnvironmentVariable).where(AgentEnvironmentVariable.agent_id == aid))
-                env_rows = [
-                    {
+                # Encrypt environment variable values
+                # Only re-encrypt if the value has actually changed
+                env_rows = []
+                for k, v in agent_secrets.items():
+                    row = {
                         "agent_id": aid,
                         "key": k,
                         "value": v,
                         "organization_id": agent.organization_id,
                     }
-                    for k, v in agent_secrets.items()
-                ]
+
+                    # Check if value changed to avoid unnecessary re-encryption
+                    existing_env = existing_env_vars.get(k)
+                    existing_value = None
+                    if existing_env:
+                        if existing_env.value_enc:
+                            existing_secret = Secret.from_encrypted(existing_env.value_enc)
+                            existing_value = existing_secret.get_plaintext()
+                        elif existing_env.value:
+                            existing_value = existing_env.value
+
+                    # Encrypt value (reuse existing encrypted value if unchanged)
+                    if existing_value == v and existing_env and existing_env.value_enc:
+                        # Value unchanged, reuse existing encrypted value
+                        row["value_enc"] = existing_env.value_enc
+                    else:
+                        # Value changed or new, encrypt
+                        value_secret = Secret.from_plaintext(v)
+                        row["value_enc"] = value_secret.get_encrypted()
+
+                    env_rows.append(row)
+
                 if env_rows:
                     await self._bulk_insert_pivot_async(session, AgentEnvironmentVariable.__table__, env_rows)
                 session.expire(agent, ["tool_exec_environment_variables"])
@@ -809,6 +871,7 @@ class AgentManager:
         identity_id: Optional[str] = None,
         identifier_keys: Optional[List[str]] = None,
         include_relationships: Optional[List[str]] = None,
+        include: List[str] = [],
         ascending: bool = True,
         sort_by: Optional[str] = "created_at",
         show_hidden_agents: Optional[bool] = None,
@@ -846,7 +909,7 @@ class AgentManager:
             query = _apply_filters(query, name, query_text, project_id, template_id, base_template_id)
             query = _apply_identity_filters(query, identity_id, identifier_keys)
             query = _apply_tag_filter(query, tags, match_all_tags)
-            query = _apply_relationship_filters(query, include_relationships)
+            query = _apply_relationship_filters(query, include_relationships, include)
 
             # Apply hidden filter
             if not show_hidden_agents:
@@ -857,7 +920,9 @@ class AgentManager:
                 query = query.limit(limit)
             result = await session.execute(query)
             agents = result.scalars().all()
-            return await asyncio.gather(*[agent.to_pydantic_async(include_relationships=include_relationships) for agent in agents])
+            return await asyncio.gather(
+                *[agent.to_pydantic_async(include_relationships=include_relationships, include=include) for agent in agents]
+            )
 
     @enforce_types
     @trace_method
@@ -916,19 +981,22 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_agent_by_id_async(
         self,
         agent_id: str,
         actor: PydanticUser,
         include_relationships: Optional[List[str]] = None,
+        include: List[str] = [],
     ) -> PydanticAgentState:
         """Fetch an agent by its ID."""
+
         async with db_registry.async_session() as session:
             try:
                 query = select(AgentModel)
                 query = AgentModel.apply_access_predicate(query, actor, ["read"], AccessType.ORGANIZATION)
                 query = query.where(AgentModel.id == agent_id)
-                query = _apply_relationship_filters(query, include_relationships)
+                query = _apply_relationship_filters(query, include_relationships, include)
 
                 result = await session.execute(query)
                 agent = result.scalar_one_or_none()
@@ -936,7 +1004,7 @@ class AgentManager:
                 if agent is None:
                     raise NoResultFound(f"Agent with ID {agent_id} not found")
 
-                return await agent.to_pydantic_async(include_relationships=include_relationships)
+                return await agent.to_pydantic_async(include_relationships=include_relationships, include=include)
             except NoResultFound:
                 # Re-raise NoResultFound without logging to preserve 404 handling
                 raise
@@ -974,6 +1042,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_agent_archive_ids_async(self, agent_id: str, actor: PydanticUser) -> List[str]:
         """Get all archive IDs associated with an agent."""
         from letta.orm import ArchivesAgents
@@ -987,6 +1056,25 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    async def validate_agent_exists_async(self, agent_id: str, actor: PydanticUser) -> None:
+        """
+        Validate that an agent exists and user has access to it.
+        Lightweight method that doesn't load the full agent object.
+
+        Args:
+            agent_id: ID of the agent to validate
+            actor: User performing the action
+
+        Raises:
+            LettaAgentNotFoundError: If agent doesn't exist or user doesn't have access
+        """
+        async with db_registry.async_session() as session:
+            await validate_agent_exists_async(session, agent_id, actor)
+
+    @enforce_types
+    @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def delete_agent_async(self, agent_id: str, actor: PydanticUser) -> None:
         """
         Deletes an agent and its associated relationships.
@@ -1049,6 +1137,7 @@ class AgentManager:
     # TODO: This can also be made more efficient, instead of getting, setting, we can do it all in one db session for one query.
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_in_context_messages(self, agent_id: str, actor: PydanticUser) -> List[PydanticMessage]:
         agent_state = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
         return await self.message_manager.get_messages_by_ids_async(message_ids=agent_state.message_ids, actor=actor)
@@ -1061,6 +1150,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_system_message_async(self, agent_id: str, actor: PydanticUser) -> PydanticMessage:
         agent = await self.get_agent_by_id_async(agent_id=agent_id, include_relationships=[], actor=actor)
         return await self.message_manager.get_message_by_id_async(message_id=agent.message_ids[0], actor=actor)
@@ -1091,7 +1181,7 @@ class AgentManager:
 
         # note: we only update the system prompt if the core memory is changed
         # this means that the archival/recall memory statistics may be someout out of date
-        curr_memory_str = agent_state.memory.compile(sources=agent_state.sources)
+        curr_memory_str = agent_state.memory.compile(sources=agent_state.sources, llm_config=agent_state.llm_config)
         if curr_memory_str in curr_system_message_openai["content"] and not force:
             # NOTE: could this cause issues if a block is removed? (substring match would still work)
             logger.debug(
@@ -1120,6 +1210,7 @@ class AgentManager:
             archival_memory_size=num_archival_memories,
             sources=agent_state.sources,
             max_files_open=agent_state.max_files_open,
+            llm_config=agent_state.llm_config,
         )
 
         diff = united_diff(curr_system_message_openai["content"], new_system_message_str)
@@ -1165,7 +1256,10 @@ class AgentManager:
 
         tool_rules_solver = ToolRulesSolver(agent_state.tool_rules)
 
-        curr_system_message = await self.message_manager.get_message_by_id_async(message_id=agent_state.message_ids[0], actor=actor)
+        if agent_state.message_ids == []:
+            curr_system_message = None
+        else:
+            curr_system_message = await self.message_manager.get_message_by_id_async(message_id=agent_state.message_ids[0], actor=actor)
 
         if curr_system_message is None:
             logger.warning(f"No system message found for agent {agent_state.id} and user {actor}")
@@ -1179,6 +1273,7 @@ class AgentManager:
             sources=agent_state.sources,
             tool_usage_rules=tool_rules_solver.compile_tool_rule_prompts(),
             max_files_open=agent_state.max_files_open,
+            llm_config=agent_state.llm_config,
         )
         if curr_memory_str in curr_system_message_openai["content"] and not force:
             # NOTE: could this cause issues if a block is removed? (substring match would still work)
@@ -1237,6 +1332,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def set_in_context_messages_async(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
         return await self.update_agent_async(agent_id=agent_id, agent_update=UpdateAgent(message_ids=message_ids), actor=actor)
 
@@ -1347,6 +1443,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def update_memory_if_changed_async(self, agent_id: str, new_memory: Memory, actor: PydanticUser) -> PydanticAgentState:
         """
         Update internal memory object and system prompt if there have been modifications.
@@ -1366,6 +1463,7 @@ class AgentManager:
             sources=agent_state.sources,
             tool_usage_rules=temp_tool_rules_solver.compile_tool_rule_prompts(),
             max_files_open=agent_state.max_files_open,
+            llm_config=agent_state.llm_config,
         )
         if new_memory_str not in system_message.content[0].text:
             # update the blocks (LRW) in the DB
@@ -1458,6 +1556,8 @@ class AgentManager:
     # ======================================================================================================================
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def attach_source_async(self, agent_id: str, source_id: str, actor: PydanticUser) -> PydanticAgentState:
         """
         Attaches a source to an agent.
@@ -1527,6 +1627,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def append_system_message_async(self, agent_id: str, content: str, actor: PydanticUser):
         """
         Async version of append_system_message.
@@ -1614,6 +1715,8 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def detach_source_async(self, agent_id: str, source_id: str, actor: PydanticUser) -> PydanticAgentState:
         """
         Detaches a source from an agent.
@@ -1699,6 +1802,8 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def attach_block_async(self, agent_id: str, block_id: str, actor: PydanticUser) -> PydanticAgentState:
         """Attaches a block to an agent. For sleeptime agents, also attaches to paired agents in the same group."""
         async with db_registry.async_session() as session:
@@ -1849,9 +1954,8 @@ class AgentManager:
         """
         import warnings
 
-        warnings.warn(
+        logger.warning(
             "list_passages_async is deprecated. Use query_source_passages_async or query_agent_passages_async instead.",
-            DeprecationWarning,
             stacklevel=2,
         )
 
@@ -2285,8 +2389,9 @@ class AgentManager:
     # Tool Management
     # ======================================================================================================================
     @enforce_types
-    @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
     async def attach_tool_async(self, agent_id: str, tool_id: str, actor: PydanticUser) -> None:
         """
         Attaches a tool to an agent.
@@ -2355,6 +2460,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def bulk_attach_tools_async(self, agent_id: str, tool_ids: List[str], actor: PydanticUser) -> None:
         """
         Efficiently attaches multiple tools to an agent in a single operation.
@@ -2520,6 +2626,8 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
     async def detach_tool_async(self, agent_id: str, tool_id: str, actor: PydanticUser) -> None:
         """
         Detaches a tool from an agent.
@@ -2549,6 +2657,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def bulk_detach_tools_async(self, agent_id: str, tool_ids: List[str], actor: PydanticUser) -> None:
         """
         Efficiently detaches multiple tools from an agent in a single operation.
@@ -2585,6 +2694,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def modify_approvals_async(self, agent_id: str, tool_name: str, requires_approval: bool, actor: PydanticUser) -> None:
         def is_target_rule(rule):
             return rule.tool_name == tool_name and rule.type == "requires_approval"
@@ -2933,6 +3043,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_agent_files_config_async(self, agent_id: str, actor: PydanticUser) -> Tuple[int, int]:
         """Get per_file_view_window_char_limit and max_files_open for an agent.
 
@@ -2989,6 +3100,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_agent_max_files_open_async(self, agent_id: str, actor: PydanticUser) -> int:
         """Get max_files_open for an agent.
 
@@ -3017,6 +3129,7 @@ class AgentManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_agent_per_file_view_window_char_limit_async(self, agent_id: str, actor: PydanticUser) -> int:
         """Get per_file_view_window_char_limit for an agent.
 
@@ -3043,14 +3156,23 @@ class AgentManager:
 
             return row
 
+    @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_context_window(self, agent_id: str, actor: PydanticUser) -> ContextWindowOverview:
         agent_state, system_message, num_messages, num_archival_memories = await self.rebuild_system_prompt_async(
             agent_id=agent_id, actor=actor, force=True, dry_run=True
         )
         calculator = ContextWindowCalculator()
 
-        if settings.environment == "PRODUCTION" or agent_state.llm_config.model_endpoint_type == "anthropic":
+        # Use Anthropic token counter if:
+        # 1. The model endpoint type is anthropic, OR
+        # 2. We're in PRODUCTION and anthropic_api_key is available
+        use_anthropic = agent_state.llm_config.model_endpoint_type == "anthropic" or (
+            settings.environment == "PRODUCTION" and model_settings.anthropic_api_key is not None
+        )
+
+        if use_anthropic:
             anthropic_client = LLMClient.create(provider_type=ProviderType.anthropic, actor=actor)
             model = agent_state.llm_config.model if agent_state.llm_config.model_endpoint_type == "anthropic" else None
 

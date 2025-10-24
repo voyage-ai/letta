@@ -1,17 +1,18 @@
 from typing import Annotated, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, Header, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import Field
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
-from letta.orm.errors import NoResultFound
-from letta.schemas.group import Group, GroupCreate, GroupUpdate, ManagerType
+from letta.schemas.group import Group, GroupBase, GroupCreate, GroupUpdate, ManagerType
 from letta.schemas.letta_message import LettaMessageUnion, LettaMessageUpdateUnion
 from letta.schemas.letta_request import LettaRequest, LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
+from letta.schemas.message import BaseMessage
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.server.server import SyncServer
+from letta.validators import GroupId, MessageId
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -69,7 +70,7 @@ async def count_groups(
 
 @router.get("/{group_id}", response_model=Group, operation_id="retrieve_group")
 async def retrieve_group(
-    group_id: str,
+    group_id: GroupId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -77,11 +78,7 @@ async def retrieve_group(
     Retrieve the group by id.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-
-    try:
-        return await server.group_manager.retrieve_group_async(group_id=group_id, actor=actor)
-    except NoResultFound as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    return await server.group_manager.retrieve_group_async(group_id=group_id, actor=actor)
 
 
 @router.post("/", response_model=Group, operation_id="create_group")
@@ -96,16 +93,13 @@ async def create_group(
     """
     Create a new multi-agent group with the specified configuration.
     """
-    try:
-        actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-        return await server.group_manager.create_group_async(group, actor=actor)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+    return await server.group_manager.create_group_async(group, actor=actor)
 
 
 @router.patch("/{group_id}", response_model=Group, operation_id="modify_group")
 async def modify_group(
-    group_id: str,
+    group_id: GroupId,
     group: GroupUpdate = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -116,16 +110,13 @@ async def modify_group(
     """
     Create a new multi-agent group with the specified configuration.
     """
-    try:
-        actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-        return await server.group_manager.modify_group_async(group_id=group_id, group_update=group, actor=actor)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+    return await server.group_manager.modify_group_async(group_id=group_id, group_update=group, actor=actor)
 
 
 @router.delete("/{group_id}", response_model=None, operation_id="delete_group")
 async def delete_group(
-    group_id: str,
+    group_id: GroupId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -133,11 +124,8 @@ async def delete_group(
     Delete a multi-agent group.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    try:
-        await server.group_manager.delete_group_async(group_id=group_id, actor=actor)
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"message": f"Group id={group_id} successfully deleted"})
-    except NoResultFound:
-        raise HTTPException(status_code=404, detail=f"Group id={group_id} not found for user_id={actor.id}.")
+    await server.group_manager.delete_group_async(group_id=group_id, actor=actor)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"message": f"Group id={group_id} successfully deleted"})
 
 
 @router.post(
@@ -146,7 +134,7 @@ async def delete_group(
     operation_id="send_group_message",
 )
 async def send_group_message(
-    group_id: str,
+    group_id: GroupId,
     server: SyncServer = Depends(get_letta_server),
     request: LettaRequest = Body(...),
     headers: HeaderParams = Depends(get_headers),
@@ -184,7 +172,7 @@ async def send_group_message(
     },
 )
 async def send_group_message_streaming(
-    group_id: str,
+    group_id: GroupId,
     server: SyncServer = Depends(get_letta_server),
     request: LettaStreamingRequest = Body(...),
     headers: HeaderParams = Depends(get_headers),
@@ -216,8 +204,8 @@ GroupMessagesResponse = Annotated[
 
 @router.patch("/{group_id}/messages/{message_id}", response_model=LettaMessageUnion, operation_id="modify_group_message")
 async def modify_group_message(
-    group_id: str,
-    message_id: str,
+    group_id: GroupId,
+    message_id: MessageId,
     request: LettaMessageUpdateUnion = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -232,7 +220,7 @@ async def modify_group_message(
 
 @router.get("/{group_id}/messages", response_model=GroupMessagesResponse, operation_id="list_group_messages")
 async def list_group_messages(
-    group_id: str,
+    group_id: GroupId,
     before: Optional[str] = Query(
         None,
         description="Message ID cursor for pagination. Returns messages that come before this message ID in the specified sort order",
@@ -246,9 +234,9 @@ async def list_group_messages(
         "desc", description="Sort order for messages by creation time. 'asc' for oldest first, 'desc' for newest first"
     ),
     order_by: Literal["created_at"] = Query("created_at", description="Field to sort by"),
-    use_assistant_message: bool = Query(True, description="Whether to use assistant messages"),
-    assistant_message_tool_name: str = Query(DEFAULT_MESSAGE_TOOL, description="The name of the designated message tool."),
-    assistant_message_tool_kwarg: str = Query(DEFAULT_MESSAGE_TOOL_KWARG, description="The name of the message argument."),
+    use_assistant_message: bool = Query(True, description="Whether to use assistant messages", deprecated=True),
+    assistant_message_tool_name: str = Query(DEFAULT_MESSAGE_TOOL, description="The name of the designated message tool.", deprecated=True),
+    assistant_message_tool_kwarg: str = Query(DEFAULT_MESSAGE_TOOL_KWARG, description="The name of the message argument.", deprecated=True),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -287,7 +275,7 @@ async def list_group_messages(
 
 @router.patch("/{group_id}/reset-messages", response_model=None, operation_id="reset_group_messages")
 async def reset_group_messages(
-    group_id: str,
+    group_id: GroupId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):

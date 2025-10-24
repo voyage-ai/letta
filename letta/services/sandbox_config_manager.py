@@ -5,7 +5,7 @@ from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.orm.sandbox_config import SandboxConfig as SandboxConfigModel, SandboxEnvironmentVariable as SandboxEnvVarModel
 from letta.otel.tracing import trace_method
-from letta.schemas.enums import SandboxType
+from letta.schemas.enums import PrimitiveType, SandboxType
 from letta.schemas.environment_variables import (
     SandboxEnvironmentVariable as PydanticEnvVar,
     SandboxEnvironmentVariableCreate,
@@ -20,6 +20,7 @@ from letta.schemas.sandbox_config import (
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.utils import enforce_types, printd
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -101,6 +102,7 @@ class SandboxConfigManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def update_sandbox_config_async(
         self, sandbox_config_id: str, sandbox_update: SandboxConfigUpdate, actor: PydanticUser
     ) -> PydanticSandboxConfig:
@@ -129,6 +131,7 @@ class SandboxConfigManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def delete_sandbox_config_async(self, sandbox_config_id: str, actor: PydanticUser) -> PydanticSandboxConfig:
         """Delete a sandbox configuration by its ID."""
         async with db_registry.async_session() as session:
@@ -176,6 +179,7 @@ class SandboxConfigManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def create_sandbox_env_var_async(
         self, env_var_create: SandboxEnvironmentVariableCreate, sandbox_config_id: str, actor: PydanticUser
     ) -> PydanticEnvVar:
@@ -198,6 +202,12 @@ class SandboxConfigManager:
             return db_env_var
         else:
             async with db_registry.async_session() as session:
+                # Explicitly encrypt the value before storing
+                from letta.schemas.secret import Secret
+
+                if env_var.value is not None:
+                    env_var.value_enc = Secret.from_plaintext(env_var.value)
+
                 env_var = SandboxEnvVarModel(**env_var.model_dump(to_orm=True, exclude_none=True))
                 await env_var.create_async(session, actor=actor)
                 return env_var.to_pydantic()
@@ -211,6 +221,31 @@ class SandboxConfigManager:
         async with db_registry.async_session() as session:
             env_var = await SandboxEnvVarModel.read_async(db_session=session, identifier=env_var_id, actor=actor)
             update_data = env_var_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
+
+            # Handle encryption for value if provided
+            # Only re-encrypt if the value has actually changed
+            if "value" in update_data and update_data["value"] is not None:
+                from letta.schemas.secret import Secret
+
+                # Check if value changed
+                existing_value = None
+                if env_var.value_enc:
+                    existing_secret = Secret.from_encrypted(env_var.value_enc)
+                    existing_value = existing_secret.get_plaintext()
+                elif env_var.value:
+                    existing_value = env_var.value
+
+                # Only re-encrypt if different
+                if existing_value != update_data["value"]:
+                    env_var.value_enc = Secret.from_plaintext(update_data["value"]).get_encrypted()
+                    # Keep plaintext for dual-write during migration
+                    env_var.value = update_data["value"]
+
+                # Remove from update_data since we set directly on env_var
+                update_data.pop("value", None)
+                update_data.pop("value_enc", None)
+
+            # Apply remaining updates
             update_data = {key: value for key, value in update_data.items() if getattr(env_var, key) != value}
 
             if update_data:
@@ -235,6 +270,7 @@ class SandboxConfigManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def list_sandbox_env_vars_async(
         self,
         sandbox_config_id: str,
@@ -271,25 +307,31 @@ class SandboxConfigManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     def get_sandbox_env_vars_as_dict(
         self, sandbox_config_id: str, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50
     ) -> Dict[str, str]:
         env_vars = self.list_sandbox_env_vars(sandbox_config_id, actor, after, limit)
         result = {}
         for env_var in env_vars:
-            result[env_var.key] = env_var.value
+            # Decrypt the value before returning
+            value_secret = env_var.get_value_secret()
+            result[env_var.key] = value_secret.get_plaintext()
         return result
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def get_sandbox_env_vars_as_dict_async(
         self, sandbox_config_id: str, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50
     ) -> Dict[str, str]:
         env_vars = await self.list_sandbox_env_vars_async(sandbox_config_id, actor, after, limit)
-        return {env_var.key: env_var.value for env_var in env_vars}
+        # Decrypt values before returning
+        return {env_var.key: env_var.get_value_secret().get_plaintext() for env_var in env_vars}
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="sandbox_config_id", expected_prefix=PrimitiveType.SANDBOX_CONFIG)
     async def get_sandbox_env_var_by_key_and_sandbox_config_id_async(
         self, key: str, sandbox_config_id: str, actor: Optional[PydanticUser] = None
     ) -> Optional[PydanticEnvVar]:

@@ -3,8 +3,6 @@ from pickletools import pyunicode
 from typing import List, Literal, Optional
 
 from httpx import AsyncClient
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
@@ -16,7 +14,7 @@ from letta.orm.run_metrics import RunMetrics as RunMetricsModel
 from letta.orm.sqlalchemy_base import AccessType
 from letta.orm.step import Step as StepModel
 from letta.otel.tracing import log_event, trace_method
-from letta.schemas.enums import AgentType, MessageRole, RunStatus
+from letta.schemas.enums import AgentType, ComparisonOperator, MessageRole, RunStatus, PrimitiveType
 from letta.schemas.job import LettaRequestConfig
 from letta.schemas.letta_message import LettaMessage, LettaMessageUnion
 from letta.schemas.letta_response import LettaResponse
@@ -33,6 +31,7 @@ from letta.services.helpers.agent_manager_helper import validate_agent_exists_as
 from letta.services.message_manager import MessageManager
 from letta.services.step_manager import StepManager
 from letta.utils import enforce_types
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -87,6 +86,7 @@ class RunManager:
         return run.to_pydantic()
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_by_id(self, run_id: str, actor: PydanticUser) -> PydanticRun:
         """Get a run by its ID."""
         async with db_registry.async_session() as session:
@@ -108,10 +108,14 @@ class RunManager:
         ascending: bool = False,
         stop_reason: Optional[str] = None,
         background: Optional[bool] = None,
+        template_family: Optional[str] = None,
+        step_count: Optional[int] = None,
+        step_count_operator: ComparisonOperator = ComparisonOperator.EQ,
+        tools_used: Optional[List[str]] = None,
     ) -> List[PydanticRun]:
         """List runs with filtering options."""
         async with db_registry.async_session() as session:
-            from sqlalchemy import select
+            from sqlalchemy import or_, select
 
             query = select(RunModel).filter(RunModel.organization_id == actor.organization_id)
 
@@ -133,6 +137,33 @@ class RunManager:
             if background is not None:
                 query = query.filter(RunModel.background == background)
 
+            # Filter by template_family (base_template_id)
+            if template_family:
+                query = query.filter(RunModel.base_template_id == template_family)
+
+            # Filter by step_count and/or tools_used - join with run_metrics
+            if step_count is not None or tools_used:
+                query = query.join(RunMetricsModel, RunModel.id == RunMetricsModel.id)
+
+                # Filter by step_count with the specified operator
+                if step_count is not None:
+                    if step_count_operator == ComparisonOperator.EQ:
+                        query = query.filter(RunMetricsModel.num_steps == step_count)
+                    elif step_count_operator == ComparisonOperator.GTE:
+                        query = query.filter(RunMetricsModel.num_steps >= step_count)
+                    elif step_count_operator == ComparisonOperator.LTE:
+                        query = query.filter(RunMetricsModel.num_steps <= step_count)
+
+                # Filter by tools used ids
+                if tools_used:
+                    from sqlalchemy import String, cast as sa_cast, type_coerce
+                    from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+
+                    # Use ?| operator to check if any tool_id exists in the array (OR logic)
+                    jsonb_tools = sa_cast(RunMetricsModel.tools_used, JSONB)
+                    tools_array = type_coerce(tools_used, ARRAY(String))
+                    query = query.filter(jsonb_tools.op("?|")(tools_array))
+
             # Apply pagination
             from letta.services.helpers.run_manager_helper import _apply_pagination_async
 
@@ -147,24 +178,22 @@ class RunManager:
             return [run.to_pydantic() for run in runs]
 
     @enforce_types
-    async def delete_run(self, run_id: str, actor: PydanticUser) -> PydanticRun:
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
+    async def delete_run(self, run_id: str, actor: PydanticUser) -> None:
         """Delete a run by its ID."""
         async with db_registry.async_session() as session:
             run = await RunModel.read_async(db_session=session, identifier=run_id, actor=actor, access_type=AccessType.ORGANIZATION)
             if not run:
                 raise NoResultFound(f"Run with id {run_id} not found")
 
-            pydantic_run = run.to_pydantic()
             await run.hard_delete_async(db_session=session, actor=actor)
 
-        return pydantic_run
-
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def update_run_by_id_async(
         self, run_id: str, update: RunUpdate, actor: PydanticUser, refresh_result_messages: bool = True
     ) -> PydanticRun:
         """Update a run using a RunUpdate object."""
-
         async with db_registry.async_session() as session:
             run = await RunModel.read_async(db_session=session, identifier=run_id, actor=actor)
 
@@ -203,15 +232,38 @@ class RunManager:
 
         # update run metrics table
         num_steps = len(await self.step_manager.list_steps_async(run_id=run_id, actor=actor))
+
+        # Collect tools used from run messages
+        tools_used = set()
+        messages = await self.message_manager.list_messages(actor=actor, run_id=run_id)
+        for message in messages:
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    if hasattr(tool_call, "function") and hasattr(tool_call.function, "name"):
+                        # Get tool ID from tool name
+                        from letta.services.tool_manager import ToolManager
+
+                        tool_manager = ToolManager()
+                        tool_name = tool_call.function.name
+                        tool_id = await tool_manager.get_tool_id_by_name_async(tool_name, actor)
+                        if tool_id:
+                            tools_used.add(tool_id)
+
         async with db_registry.async_session() as session:
             metrics = await RunMetricsModel.read_async(db_session=session, identifier=run_id, actor=actor)
             # Calculate runtime if run is completing
-            if is_terminal_update and metrics.run_start_ns:
-                import time
+            if is_terminal_update:
+                # Use total_duration_ns from RunUpdate if provided
+                # Otherwise fall back to system time
+                if update.total_duration_ns is not None:
+                    metrics.run_ns = update.total_duration_ns
+                elif metrics.run_start_ns:
+                    import time
 
-                current_ns = int(time.time() * 1e9)
-                metrics.run_ns = current_ns - metrics.run_start_ns
+                    current_ns = int(time.time() * 1e9)
+                    metrics.run_ns = current_ns - metrics.run_start_ns
             metrics.num_steps = num_steps
+            metrics.tools_used = list(tools_used) if tools_used else None
             await metrics.update_async(db_session=session, actor=actor, no_commit=True, no_refresh=True)
             await session.commit()
 
@@ -267,7 +319,7 @@ class RunManager:
                 log_event("POST callback finished")
                 result["callback_status_code"] = resp.status_code
         except Exception as e:
-            error_message = f"Failed to dispatch callback for run {callback_info['run_id']} to {callback_info['callback_url']}: {e!s}"
+            error_message = f"Failed to dispatch callback for run {callback_info['run_id']} to {callback_info['callback_url']}: {e!r}"
             logger.error(error_message)
             result["callback_error"] = error_message
             # Continue silently - callback failures should not affect run completion
@@ -275,6 +327,7 @@ class RunManager:
             return result
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_usage(self, run_id: str, actor: PydanticUser) -> LettaUsageStatistics:
         """Get usage statistics for a run."""
         async with db_registry.async_session() as session:
@@ -292,6 +345,7 @@ class RunManager:
         return total_usage
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_messages(
         self,
         run_id: str,
@@ -326,6 +380,7 @@ class RunManager:
         return letta_messages
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_request_config(self, run_id: str, actor: PydanticUser) -> Optional[LettaRequestConfig]:
         """Get the letta request config from a run."""
         async with db_registry.async_session() as session:
@@ -336,6 +391,7 @@ class RunManager:
             return pydantic_run.request_config
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_metrics_async(self, run_id: str, actor: PydanticUser) -> PydanticRunMetrics:
         """Get metrics for a run."""
         async with db_registry.async_session() as session:
@@ -343,6 +399,7 @@ class RunManager:
             return metrics.to_pydantic()
 
     @enforce_types
+    @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     async def get_run_steps(
         self,
         run_id: str,

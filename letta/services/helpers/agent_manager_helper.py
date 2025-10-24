@@ -2,6 +2,10 @@ import uuid
 from datetime import datetime
 from typing import List, Literal, Optional, Set
 
+from letta.log import get_logger
+
+logger = get_logger(__name__)
+
 import numpy as np
 from sqlalchemy import Select, and_, asc, desc, func, literal, nulls_last, or_, select, union_all
 from sqlalchemy.orm import noload
@@ -38,7 +42,7 @@ from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import AgentType, MessageRole
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.memory import Memory
-from letta.schemas.message import Message, MessageCreate
+from letta.schemas.message import Message, MessageCreate, ToolReturn
 from letta.schemas.tool_rule import ToolRule
 from letta.schemas.user import User
 from letta.settings import DatabaseChoice, settings
@@ -256,6 +260,7 @@ def compile_system_message(
     tool_rules_solver: Optional[ToolRulesSolver] = None,
     sources: Optional[List] = None,
     max_files_open: Optional[int] = None,
+    llm_config: Optional[object] = None,
 ) -> str:
     """Prepare the final/full system message that will be fed into the LLM API
 
@@ -289,7 +294,7 @@ def compile_system_message(
         )
 
         memory_with_sources = in_context_memory.compile(
-            tool_usage_rules=tool_constraint_block, sources=sources, max_files_open=max_files_open
+            tool_usage_rules=tool_constraint_block, sources=sources, max_files_open=max_files_open, llm_config=llm_config
         )
         full_memory_string = memory_with_sources + "\n\n" + memory_metadata_string
 
@@ -303,7 +308,7 @@ def compile_system_message(
         if append_icm_if_missing:
             if memory_variable_string not in system_prompt:
                 # In this case, append it to the end to make sure memory is still injected
-                # warnings.warn(f"{IN_CONTEXT_MEMORY_KEYWORD} variable was missing from system prompt, appending instead")
+                # logger.warning(f"{IN_CONTEXT_MEMORY_KEYWORD} variable was missing from system prompt, appending instead")
                 system_prompt += "\n\n" + memory_variable_string
 
         # render the variables using the built-in templater
@@ -536,6 +541,13 @@ def package_initial_message_sequence(
                     agent_id=agent_id,
                     model=model,
                     tool_call_id=tool_call_id,
+                    tool_returns=[
+                        ToolReturn(
+                            tool_call_id=tool_call_id,
+                            status="success",
+                            func_response=function_response,
+                        )
+                    ],
                 )
             )
         else:
@@ -767,22 +779,64 @@ def _apply_filters(
     return query
 
 
-def _apply_relationship_filters(query, include_relationships: Optional[List[str]] = None):
-    if include_relationships is None:
+def _apply_relationship_filters(
+    query,
+    include_relationships: Optional[List[str]] = None,
+    include: Optional[List[str]] = None,
+):
+    # legacy include_relationships
+    if include_relationships is None and not include:
         return query
 
-    if "memory" not in include_relationships:
-        query = query.options(noload(AgentModel.core_memory), noload(AgentModel.file_agents))
-    if "identity_ids" not in include_relationships:
-        query = query.options(noload(AgentModel.identities))
+    column_names = get_column_names_from_includes_params(include_relationships, include)
 
-    relationships = ["tool_exec_environment_variables", "tools", "sources", "tags", "multi_agent_group"]
+    relationships = [
+        "core_memory",
+        "file_agents",
+        "identities",
+        "tool_exec_environment_variables",
+        "tools",
+        "sources",
+        "tags",
+        "multi_agent_group",
+    ]
 
     for rel in relationships:
-        if rel not in include_relationships:
+        if rel not in column_names:
             query = query.options(noload(getattr(AgentModel, rel)))
 
     return query
+
+
+def get_column_names_from_includes_params(
+    include_relationships: Optional[List[str]] = None, includes: Optional[List[str]] = None
+) -> Set[str]:
+    include_mapping = {
+        "agent.blocks": ["core_memory"],
+        "agent.identities": ["identities"],
+        "agent.managed_group": ["multi_agent_group"],
+        "agent.secrets": ["tool_exec_environment_variables"],
+        "agent.sources": ["sources"],
+        "agent.tags": ["tags"],
+        "agent.tools": ["tools"],
+        # legacy
+        "memory": ["core_memory", "file_agents"],
+        "identity_ids": ["identities"],
+        "multi_agent_group": ["multi_agent_group"],
+        "tool_exec_environment_variables": ["tool_exec_environment_variables"],
+        "secrets": ["tool_exec_environment_variables"],
+        "sources": ["sources"],
+        "tags": ["tags"],
+        "tools": ["tools"],
+    }
+    column_names = set()
+    if includes:
+        for include in includes:
+            column_names.update(include_mapping.get(include, []))
+    else:
+        for include_relationship in include_relationships:
+            column_names.update(include_mapping.get(include_relationship, []))
+    return column_names
 
 
 async def build_passage_query(

@@ -44,7 +44,7 @@ from letta.constants import (
     MULTI_AGENT_TOOLS,
 )
 from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
-from letta.errors import LettaAgentNotFoundError
+from letta.errors import LettaAgentNotFoundError, LettaInvalidArgumentError
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.functions.mcp_client.types import MCPTool
 from letta.helpers import ToolRulesSolver
@@ -241,7 +241,7 @@ async def test_update_run_auto_complete(server: SyncServer, default_user, sarah_
 async def test_get_run_not_found(server: SyncServer, default_user):
     """Test fetching a non-existent run."""
     non_existent_run_id = "nonexistent-id"
-    with pytest.raises(NoResultFound):
+    with pytest.raises(LettaInvalidArgumentError):
         await server.run_manager.get_run_by_id(non_existent_run_id, actor=default_user)
 
 
@@ -249,7 +249,7 @@ async def test_get_run_not_found(server: SyncServer, default_user):
 async def test_delete_run_not_found(server: SyncServer, default_user):
     """Test deleting a non-existent run."""
     non_existent_run_id = "nonexistent-id"
-    with pytest.raises(NoResultFound):
+    with pytest.raises(LettaInvalidArgumentError):
         await server.run_manager.delete_run(non_existent_run_id, actor=default_user)
 
 
@@ -380,6 +380,243 @@ async def test_list_runs_by_stop_reason(server: SyncServer, sarah_agent, default
     runs = await server.run_manager.list_runs(actor=default_user, agent_ids=[sarah_agent.id])
     assert len(runs) == 1
     assert runs[0].id == run.id
+
+
+@pytest.mark.asyncio
+async def test_list_runs_by_tools_used(server: SyncServer, sarah_agent, default_user):
+    """Test listing runs filtered by tools used."""
+    # Seed tools first
+    from letta.services.tool_manager import ToolManager
+
+    tool_manager = ToolManager()
+    await tool_manager.upsert_base_tools_async(default_user)
+
+    web_search_tool_id = await tool_manager.get_tool_id_by_name_async("web_search", default_user)
+    run_code_tool_id = await tool_manager.get_tool_id_by_name_async("run_code", default_user)
+
+    if not web_search_tool_id or not run_code_tool_id:
+        pytest.skip("Required tools (web_search, run_code) are not available in the database")
+
+    # Create run with web_search tool
+    run_web = await server.run_manager.create_run(
+        pydantic_run=PydanticRun(agent_id=sarah_agent.id),
+        actor=default_user,
+    )
+    await server.message_manager.create_many_messages_async(
+        [
+            PydanticMessage(
+                agent_id=sarah_agent.id,
+                role=MessageRole.assistant,
+                content=[TextContent(text="Using web search")],
+                tool_calls=[
+                    OpenAIToolCall(
+                        id="call_web",
+                        type="function",
+                        function=OpenAIFunction(name="web_search", arguments="{}"),
+                    )
+                ],
+                run_id=run_web.id,
+            )
+        ],
+        actor=default_user,
+    )
+
+    # Create run with run_code tool
+    run_code = await server.run_manager.create_run(
+        pydantic_run=PydanticRun(agent_id=sarah_agent.id),
+        actor=default_user,
+    )
+    await server.message_manager.create_many_messages_async(
+        [
+            PydanticMessage(
+                agent_id=sarah_agent.id,
+                role=MessageRole.assistant,
+                content=[TextContent(text="Using run code")],
+                tool_calls=[
+                    OpenAIToolCall(
+                        id="call_code",
+                        type="function",
+                        function=OpenAIFunction(name="run_code", arguments="{}"),
+                    )
+                ],
+                run_id=run_code.id,
+            )
+        ],
+        actor=default_user,
+    )
+
+    # Complete runs to populate tools_used
+    await server.run_manager.update_run_by_id_async(
+        run_web.id, RunUpdate(status=RunStatus.completed, stop_reason=StopReasonType.end_turn), actor=default_user
+    )
+    await server.run_manager.update_run_by_id_async(
+        run_code.id, RunUpdate(status=RunStatus.completed, stop_reason=StopReasonType.end_turn), actor=default_user
+    )
+
+    # Test filtering by single tool
+    runs_web = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        tools_used=[web_search_tool_id],
+    )
+    assert len(runs_web) == 1
+    assert runs_web[0].id == run_web.id
+
+    # Test filtering by multiple tools
+    runs_multi = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        tools_used=[web_search_tool_id, run_code_tool_id],
+    )
+    assert len(runs_multi) == 2
+    assert {r.id for r in runs_multi} == {run_web.id, run_code.id}
+
+
+@pytest.mark.asyncio
+async def test_list_runs_by_step_count(server: SyncServer, sarah_agent, default_user):
+    """Test listing runs filtered by step count."""
+    from letta.schemas.enums import ComparisonOperator
+
+    # Create runs with different numbers of steps
+    runs_data = []
+
+    # Run with 0 steps
+    run_0 = await server.run_manager.create_run(
+        pydantic_run=PydanticRun(
+            agent_id=sarah_agent.id,
+            metadata={"steps": 0},
+        ),
+        actor=default_user,
+    )
+    runs_data.append((run_0, 0))
+
+    # Run with 2 steps
+    run_2 = await server.run_manager.create_run(
+        pydantic_run=PydanticRun(
+            agent_id=sarah_agent.id,
+            metadata={"steps": 2},
+        ),
+        actor=default_user,
+    )
+    for i in range(2):
+        await server.step_manager.log_step_async(
+            agent_id=sarah_agent.id,
+            provider_name="openai",
+            provider_category="base",
+            model="gpt-4o-mini",
+            model_endpoint="https://api.openai.com/v1",
+            context_window_limit=8192,
+            usage=UsageStatistics(
+                completion_tokens=100,
+                prompt_tokens=50,
+                total_tokens=150,
+            ),
+            run_id=run_2.id,
+            actor=default_user,
+            project_id=sarah_agent.project_id,
+        )
+    runs_data.append((run_2, 2))
+
+    # Run with 5 steps
+    run_5 = await server.run_manager.create_run(
+        pydantic_run=PydanticRun(
+            agent_id=sarah_agent.id,
+            metadata={"steps": 5},
+        ),
+        actor=default_user,
+    )
+    for i in range(5):
+        await server.step_manager.log_step_async(
+            agent_id=sarah_agent.id,
+            provider_name="openai",
+            provider_category="base",
+            model="gpt-4o-mini",
+            model_endpoint="https://api.openai.com/v1",
+            context_window_limit=8192,
+            usage=UsageStatistics(
+                completion_tokens=100,
+                prompt_tokens=50,
+                total_tokens=150,
+            ),
+            run_id=run_5.id,
+            actor=default_user,
+            project_id=sarah_agent.project_id,
+        )
+    runs_data.append((run_5, 5))
+
+    # Update all runs to trigger metrics update
+    for run, _ in runs_data:
+        await server.run_manager.update_run_by_id_async(
+            run.id,
+            RunUpdate(status=RunStatus.completed, stop_reason=StopReasonType.end_turn),
+            actor=default_user,
+        )
+
+    # Test EQ operator - exact match
+    runs_eq_2 = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        step_count=2,
+        step_count_operator=ComparisonOperator.EQ,
+    )
+    assert len(runs_eq_2) == 1
+    assert runs_eq_2[0].id == run_2.id
+
+    # Test GTE operator - greater than or equal
+    runs_gte_2 = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        step_count=2,
+        step_count_operator=ComparisonOperator.GTE,
+    )
+    assert len(runs_gte_2) == 2
+    run_ids_gte = {run.id for run in runs_gte_2}
+    assert run_2.id in run_ids_gte
+    assert run_5.id in run_ids_gte
+
+    # Test LTE operator - less than or equal
+    runs_lte_2 = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        step_count=2,
+        step_count_operator=ComparisonOperator.LTE,
+    )
+    assert len(runs_lte_2) == 2
+    run_ids_lte = {run.id for run in runs_lte_2}
+    assert run_0.id in run_ids_lte
+    assert run_2.id in run_ids_lte
+
+    # Test GTE with 0 - should return all runs
+    runs_gte_0 = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        step_count=0,
+        step_count_operator=ComparisonOperator.GTE,
+    )
+    assert len(runs_gte_0) == 3
+
+    # Test LTE with 0 - should return only run with 0 steps
+    runs_lte_0 = await server.run_manager.list_runs(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        step_count=0,
+        step_count_operator=ComparisonOperator.LTE,
+    )
+    assert len(runs_lte_0) == 1
+    assert runs_lte_0[0].id == run_0.id
+
+
+@pytest.mark.asyncio
+async def test_list_runs_by_base_template_id(server: SyncServer, sarah_agent, default_user):
+    """Test listing runs by template family."""
+    run_data = PydanticRun(
+        agent_id=sarah_agent.id,
+        base_template_id="test-template-family",
+    )
+
+    await server.run_manager.create_run(pydantic_run=run_data, actor=default_user)
+    runs = await server.run_manager.list_runs(actor=default_user, template_family="test-template-family")
+    assert len(runs) == 1
 
 
 async def test_e2e_run_callback(monkeypatch, server: SyncServer, default_user, sarah_agent):
@@ -1031,7 +1268,7 @@ async def test_run_usage_stats_get_nonexistent_run(server: SyncServer, default_u
     """Test getting usage statistics for a nonexistent run."""
     run_manager = server.run_manager
 
-    with pytest.raises(NoResultFound):
+    with pytest.raises(LettaInvalidArgumentError):
         await run_manager.get_run_usage(run_id="nonexistent_run", actor=default_user)
 
 
@@ -1070,7 +1307,7 @@ async def test_get_run_request_config_none(server: SyncServer, sarah_agent, defa
 @pytest.mark.asyncio
 async def test_get_run_request_config_nonexistent_run(server: SyncServer, default_user):
     """Test getting request config for a nonexistent run."""
-    with pytest.raises(NoResultFound):
+    with pytest.raises(LettaInvalidArgumentError):
         await server.run_manager.get_run_request_config("nonexistent_run", actor=default_user)
 
 
@@ -1216,7 +1453,7 @@ async def test_run_metrics_num_steps_tracking(server: SyncServer, sarah_agent, d
 @pytest.mark.asyncio
 async def test_run_metrics_not_found(server: SyncServer, default_user):
     """Test getting metrics for non-existent run."""
-    with pytest.raises(NoResultFound):
+    with pytest.raises(LettaInvalidArgumentError):
         await server.run_manager.get_run_metrics_async(run_id="nonexistent_run", actor=default_user)
 
 

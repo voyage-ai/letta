@@ -16,6 +16,13 @@ paths:
       x-fern-sdk-group-name:
         - tools
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - tools
@@ -109,6 +116,13 @@ paths:
       x-fern-sdk-group-name:
         - sources
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - sources
@@ -165,6 +179,13 @@ paths:
       x-fern-sdk-group-name:
         - folders
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - folders
@@ -238,6 +259,13 @@ paths:
       x-fern-sdk-group-name:
         - agents
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - agents
@@ -430,22 +458,6 @@ paths:
           schema:
             type: string
   /v1/agents/{agent_id}/archival-memory/{memory_id}:
-    patch:
-      x-fern-sdk-group-name:
-        - agents
-        - passages
-      x-fern-sdk-method-name: modify
-      parameters:
-        - name: agent_id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: memory_id
-          in: path
-          required: true
-          schema:
-            type: string
     delete:
       x-fern-sdk-group-name:
         - agents
@@ -462,6 +474,13 @@ paths:
           required: true
           schema:
             type: string
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
   /v1/agents/{agent_id}/archival-memory/search:
     get:
       x-fern-sdk-group-name:
@@ -578,36 +597,6 @@ paths:
         - agents
         - messages
       x-fern-sdk-method-name: summarize
-  /v1/agents/{agent_id}/template:
-    post:
-      x-fern-sdk-group-name:
-        - agents
-        - templates
-      x-fern-sdk-method-name: create
-      description: |
-        <Note>This endpoint is only available on Letta Cloud.</Note>
-
-        Creates a template from an agent.
-  /v1/agents/{agent_id}/migrate:
-    post:
-      x-fern-sdk-group-name:
-        - agents
-        - templates
-      x-fern-sdk-method-name: migrate
-      description: |
-        <Note>This endpoint is only available on Letta Cloud.</Note>
-
-        Migrate an agent to a new versioned agent template.
-  /v1/agents/{agent_id}/version-template:
-    post:
-      x-fern-sdk-group-name:
-        - agents
-        - templates
-      x-fern-sdk-method-name: create_version
-      description: |
-        <Note>This endpoint is only available on Letta Cloud.</Note>
-
-        Creates a new version of the template version of the agent.
   /v1/agents/{agent_id}/core-memory/variables:
     get:
       x-fern-sdk-group-name:
@@ -698,6 +687,74 @@ paths:
           required: true
           schema:
             type: string
+  /v1/agents/{agent_id}/archives/attach/{archive_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - agents
+        - archives
+      x-fern-sdk-method-name: attach
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: archive_id
+          in: path
+          required: true
+          schema:
+            type: string
+  /v1/agents/{agent_id}/archives/detach/{archive_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - agents
+        - archives
+      x-fern-sdk-method-name: detach
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: archive_id
+          in: path
+          required: true
+          schema:
+            type: string
+  /v1/agents/{agent_id}/identities/attach/{identity_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - agents
+        - identities
+      x-fern-sdk-method-name: attach
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: identity_id
+          in: path
+          required: true
+          schema:
+            type: string
+  /v1/agents/{agent_id}/identities/detach/{identity_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - agents
+        - identities
+      x-fern-sdk-method-name: detach
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: identity_id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/agents/import:
     post:
       x-fern-sdk-group-name:
@@ -756,6 +813,13 @@ paths:
       x-fern-sdk-group-name:
         - blocks
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - blocks
@@ -771,6 +835,40 @@ paths:
         - blocks
         - agents
       x-fern-sdk-method-name: list
+  /v1/blocks/{block_id}/identities/attach/{identity_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - blocks
+        - identities
+      x-fern-sdk-method-name: attach
+      parameters:
+        - name: block_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: identity_id
+          in: path
+          required: true
+          schema:
+            type: string
+  /v1/blocks/{block_id}/identities/detach/{identity_id}:
+    patch:
+      x-fern-sdk-group-name:
+        - blocks
+        - identities
+      x-fern-sdk-method-name: detach
+      parameters:
+        - name: block_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: identity_id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/jobs/:
     get:
       x-fern-sdk-group-name:
@@ -886,6 +984,13 @@ paths:
       x-fern-sdk-group-name:
         - providers
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
     patch:
       x-fern-sdk-group-name:
         - providers
@@ -955,6 +1060,13 @@ paths:
       x-fern-sdk-group-name:
         - identities
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
   /v1/identities/count:
     get:
       x-fern-sdk-group-name:
@@ -1003,6 +1115,13 @@ paths:
       x-fern-sdk-group-name:
         - groups
       x-fern-sdk-method-name: delete
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              example:
+                success: true
   /v1/groups/count:
     get:
       x-fern-sdk-group-name:
@@ -1107,6 +1226,12 @@ paths:
         - batches
         - messages
       x-fern-sdk-method-name: list
+  /v1/chat/completions:
+    post:
+      x-fern-sdk-group-name:
+        - chat
+        - completions
+      x-fern-sdk-method-name: create
   /v1/embeddings/total_storage_size:
     get:
       x-fern-ignore: true
@@ -1129,6 +1254,9 @@ paths:
       x-fern-ignore: true
   /v1/_internal_templates/blocks/batch:
     post:
+      x-fern-ignore: true
+  /v1/_internal_runs/:
+    get:
       x-fern-ignore: true
   /v1/projects:
     get:

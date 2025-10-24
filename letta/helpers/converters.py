@@ -8,6 +8,7 @@ from sqlalchemy import Dialect
 from letta.functions.mcp_client.types import StdioServerConfig
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import ProviderType, ToolRuleType
+from letta.schemas.letta_message import ApprovalReturn, MessageReturnType
 from letta.schemas.letta_message_content import (
     ImageContent,
     ImageSourceType,
@@ -180,6 +181,7 @@ def deserialize_tool_calls(data: Optional[List[Dict]]) -> List[OpenAIToolCall]:
 
     calls = []
     for item in data:
+        item.pop("requires_approval", None)  # legacy field
         func_data = item.pop("function", None)
         tool_call_function = OpenAIFunction(**func_data)
         calls.append(OpenAIToolCall(function=tool_call_function, **item))
@@ -220,6 +222,49 @@ def deserialize_tool_returns(data: Optional[List[Dict]]) -> List[ToolReturn]:
         tool_returns.append(tool_return)
 
     return tool_returns
+
+
+# --------------------------
+# Approvals Serialization
+# --------------------------
+
+
+def serialize_approvals(approvals: Optional[List[Union[ApprovalReturn, ToolReturn, dict]]]) -> List[Dict]:
+    """Convert a list of ToolReturn objects into JSON-serializable format."""
+    if not approvals:
+        return []
+
+    serialized_approvals = []
+    for approval in approvals:
+        if isinstance(approval, ApprovalReturn):
+            serialized_approvals.append(approval.model_dump(mode="json"))
+        elif isinstance(approval, ToolReturn):
+            serialized_approvals.append(approval.model_dump(mode="json"))
+        elif isinstance(approval, dict):
+            serialized_approvals.append(approval)  # Already a dictionary, leave it as-is
+        else:
+            raise TypeError(f"Unexpected approval type: {type(approval)}")
+
+    return serialized_approvals
+
+
+def deserialize_approvals(data: Optional[List[Dict]]) -> List[Union[ApprovalReturn, ToolReturn]]:
+    """Convert a JSON list back into ApprovalReturn and ToolReturn objects."""
+    if not data:
+        return []
+
+    approvals = []
+    for item in data:
+        if "type" in item and item.get("type") == MessageReturnType.approval:
+            approval_return = ApprovalReturn(**item)
+            approvals.append(approval_return)
+        elif "status" in item:
+            tool_return = ToolReturn(**item)
+            approvals.append(tool_return)
+        else:
+            continue
+
+    return approvals
 
 
 # ----------------------------
@@ -459,14 +504,43 @@ def deserialize_response_format(data: Optional[Dict]) -> Optional[ResponseFormat
 
 
 def serialize_mcp_stdio_config(config: Union[Optional[StdioServerConfig], Dict]) -> Optional[Dict]:
-    """Convert an StdioServerConfig object into a JSON-serializable dictionary."""
+    """Convert an StdioServerConfig object into a JSON-serializable dictionary.
+
+    Persist required fields for successful deserialization back into a
+    StdioServerConfig model (namely `server_name` and `type`). The
+    `to_dict()` helper intentionally omits these since they're not needed
+    by MCP transport, but our ORM deserializer reconstructs the pydantic
+    model and requires them.
+    """
     if config and isinstance(config, StdioServerConfig):
-        return config.to_dict()
+        data = config.to_dict()
+        # Preserve required fields for pydantic reconstruction
+        data["server_name"] = config.server_name
+        # Store enum as its value; pydantic will coerce on load
+        data["type"] = config.type.value if hasattr(config.type, "value") else str(config.type)
+        return data
     return config
 
 
 def deserialize_mcp_stdio_config(data: Optional[Dict]) -> Optional[StdioServerConfig]:
-    """Convert a dictionary back into an StdioServerConfig object."""
+    """Convert a dictionary back into an StdioServerConfig object.
+
+    Backwards-compatibility notes:
+    - Older rows may only include `transport`, `command`, `args`, `env`.
+      In that case, provide defaults for `server_name` and `type` to
+      satisfy the pydantic model requirements.
+    - If both `type` and `transport` are present, prefer `type`.
+    """
     if not data:
         return None
-    return StdioServerConfig(**data)
+
+    payload = dict(data)
+    # Map legacy `transport` field to required `type` if missing
+    if "type" not in payload and "transport" in payload:
+        payload["type"] = payload["transport"]
+
+    # Ensure required field exists; use a sensible placeholder when unknown
+    if "server_name" not in payload:
+        payload["server_name"] = payload.get("name", "unknown")
+
+    return StdioServerConfig(**payload)

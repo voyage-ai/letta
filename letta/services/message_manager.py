@@ -7,11 +7,10 @@ from sqlalchemy import delete, exists, func, select, text
 
 from letta.constants import CONVERSATION_SEARCH_TOOL_NAME, DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
 from letta.log import get_logger
-from letta.orm.agent import Agent as AgentModel
 from letta.orm.errors import NoResultFound
 from letta.orm.message import Message as MessageModel
 from letta.otel.tracing import trace_method
-from letta.schemas.enums import MessageRole
+from letta.schemas.enums import MessageRole, PrimitiveType
 from letta.schemas.letta_message import LettaMessageUpdateUnion
 from letta.schemas.letta_message_content import ImageSourceType, LettaImage, MessageContentType, TextContent
 from letta.schemas.message import Message as PydanticMessage, MessageSearchResult, MessageUpdate
@@ -21,8 +20,102 @@ from letta.services.file_manager import FileManager
 from letta.services.helpers.agent_manager_helper import validate_agent_exists_async
 from letta.settings import DatabaseChoice, settings
 from letta.utils import enforce_types, fire_and_forget
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
+
+
+@trace_method
+def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = None, actor: Optional[PydanticUser] = None) -> list:
+    """Backfill missing tool_call_id values in tool messages from historical bug (oct 1-6, 2025)
+
+    Args:
+        messages: List of messages to backfill
+        agent_id: Optional agent ID for logging
+        actor: Optional actor information for logging
+
+    Returns:
+        List of messages with tool_call_ids backfilled where appropriate
+    """
+    if not messages:
+        return messages
+
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Check if messages are ordered chronologically (oldest first)
+    # If not, reverse the list to ensure proper chronological order
+    was_reversed = False
+    if len(messages) > 1:
+        first_msg = messages[0]
+        last_msg = messages[-1]
+
+        # Only check PydanticMessage objects that have created_at
+        if (
+            isinstance(first_msg, PydanticMessage)
+            and isinstance(last_msg, PydanticMessage)
+            and hasattr(first_msg, "created_at")
+            and hasattr(last_msg, "created_at")
+        ):
+            # If first message is newer than last message, list is reversed
+            if first_msg.created_at > last_msg.created_at:
+                was_reversed = True
+                messages.reverse()
+
+    updated_messages = []
+    last_tool_call_id = None
+    backfilled_count = 0
+
+    for i, message in enumerate(messages):
+        if not isinstance(message, PydanticMessage):
+            updated_messages.append(message)
+            continue
+
+        # check if assistant message has a single tool call to track
+        if message.role == MessageRole.assistant and message.tool_calls:
+            if len(message.tool_calls) == 1 and message.tool_calls[0].id:
+                last_tool_call_id = message.tool_calls[0].id
+            else:
+                # parallel tool calls or missing id - don't backfill
+                last_tool_call_id = None
+
+        # check if tool message needs backfilling
+        elif message.role == MessageRole.tool:
+            needs_update = False
+
+            # only backfill if we have a single tool return and a preceding tool call id
+            if message.tool_returns and len(message.tool_returns) == 1 and last_tool_call_id is not None:
+                # check and update message.tool_call_id
+                if message.tool_call_id is None:
+                    message.tool_call_id = last_tool_call_id
+                    needs_update = True
+
+                # check and update tool_return.tool_call_id
+                tool_return = message.tool_returns[0]
+                if tool_return.tool_call_id is None:
+                    tool_return.tool_call_id = last_tool_call_id
+                    needs_update = True
+
+                if needs_update:
+                    backfilled_count += 1
+                    logger.debug(f"Backfilled tool_call_id '{last_tool_call_id}' for message {i} (id={message.id})")
+
+            # clear last_tool_call_id after processing tool message
+            last_tool_call_id = None
+
+        updated_messages.append(message)
+
+    # log warning with context if any backfilling occurred
+    if backfilled_count > 0:
+        actor_info = f"actor_id={actor.id}" if actor else "actor=unknown"
+        agent_info = f"agent_id={agent_id}" if agent_id else "agent=unknown"
+        logger.warning(
+            f"Backfilled {backfilled_count} missing tool_call_ids for historical messages (oct 1-6, 2025 bug) - {agent_info}, {actor_info}"
+        )
+
+    if was_reversed:
+        updated_messages.reverse()
+
+    return updated_messages
 
 
 class MessageManager:
@@ -216,6 +309,7 @@ class MessageManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="message_id", expected_prefix=PrimitiveType.MESSAGE)
     async def get_message_by_id_async(self, message_id: str, actor: PydanticUser) -> Optional[PydanticMessage]:
         """Fetch a message by ID."""
         async with db_registry.async_session() as session:
@@ -244,7 +338,14 @@ class MessageManager:
             )
         # Sort results directly based on message_ids
         result_dict = {msg.id: msg.to_pydantic() for msg in results}
-        return list(filter(lambda x: x is not None, [result_dict.get(msg_id, None) for msg_id in message_ids]))
+        messages = list(filter(lambda x: x is not None, [result_dict.get(msg_id, None) for msg_id in message_ids]))
+
+        # backfill missing tool_call_ids from historical bug (oct 1-6, 2025)
+        # Note: we don't have agent_id or actor here, but that's OK for logging
+        # TODO: This can cause bugs technically, if we adversarially craft a series of message_ids that are not contiguous
+        # TODO: But usually, this is being used by the agent loop code to get the in context messages, which are contiguous
+        # TODO: We should remove this as soon as possible, need to inspect for the above log message, if it hasn't happened in a while
+        return backfill_missing_tool_call_ids(messages)
 
     def _create_many_preprocess(self, pydantic_msgs: List[PydanticMessage], actor: PydanticUser) -> List[MessageModel]:
         # Create ORM model instances for all messages
@@ -613,6 +714,7 @@ class MessageManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="message_id", expected_prefix=PrimitiveType.MESSAGE)
     async def delete_message_by_id_async(self, message_id: str, actor: PydanticUser, strict_mode: bool = False) -> bool:
         """Delete a message (async version with turbopuffer support)."""
         # capture agent_id before deletion
@@ -803,7 +905,10 @@ class MessageManager:
             # Execute and convert each Message to its Pydantic representation.
             result = await session.execute(query)
             results = result.scalars().all()
-            return [msg.to_pydantic() for msg in results]
+            messages = [msg.to_pydantic() for msg in results]
+
+            # backfill missing tool_call_ids from historical bug (oct 1-6, 2025)
+            return backfill_missing_tool_call_ids(messages, agent_id=agent_id, actor=actor)
 
     @enforce_types
     @trace_method

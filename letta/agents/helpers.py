@@ -13,7 +13,7 @@ from letta.schemas.letta_message import MessageType
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
-from letta.schemas.message import Message, MessageCreate, MessageCreateBase
+from letta.schemas.message import ApprovalCreate, Message, MessageCreate, MessageCreateBase
 from letta.schemas.tool_execution_result import ToolExecutionResult
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
@@ -135,6 +135,24 @@ async def _prepare_in_context_messages_async(
     return current_in_context_messages, new_in_context_messages
 
 
+def validate_approval_tool_call_ids(approval_request_message: Message, approval_response_message: ApprovalCreate):
+    approval_requests = approval_request_message.tool_calls
+    approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
+
+    approval_responses = approval_response_message.approvals
+    approval_response_tool_call_ids = [approval_response.tool_call_id for approval_response in approval_responses]
+
+    request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
+    if request_response_diff:
+        if len(approval_request_tool_call_ids) == 1 and approval_response_tool_call_ids[0] == approval_request_message.id:
+            # legacy case where we used to use message id instead of tool call id
+            return
+
+        raise ValueError(
+            f"Invalid tool call IDs. Expected '{approval_request_tool_call_ids}', but received '{approval_response_tool_call_ids}'."
+        )
+
+
 async def _prepare_in_context_messages_no_persist_async(
     input_messages: List[MessageCreateBase],
     agent_state: AgentState,
@@ -168,20 +186,18 @@ async def _prepare_in_context_messages_no_persist_async(
     # Check for approval-related message validation
     if len(input_messages) == 1 and input_messages[0].type == "approval":
         # User is trying to send an approval response
-        if current_in_context_messages[-1].role != "approval":
+        if current_in_context_messages and current_in_context_messages[-1].role != "approval":
             raise ValueError(
                 "Cannot process approval response: No tool call is currently awaiting approval. "
                 "Please send a regular message to interact with the agent."
             )
-        if input_messages[0].approval_request_id != current_in_context_messages[-1].id:
-            raise ValueError(
-                f"Invalid approval request ID. Expected '{current_in_context_messages[-1].id}' "
-                f"but received '{input_messages[0].approval_request_id}'."
-            )
-        new_in_context_messages = create_approval_response_message_from_input(agent_state=agent_state, input_message=input_messages[0])
+        validate_approval_tool_call_ids(current_in_context_messages[-1], input_messages[0])
+        new_in_context_messages = create_approval_response_message_from_input(
+            agent_state=agent_state, input_message=input_messages[0], run_id=run_id
+        )
     else:
         # User is trying to send a regular message
-        if current_in_context_messages[-1].role == "approval":
+        if current_in_context_messages and current_in_context_messages[-1].role == "approval":
             raise PendingApprovalError(pending_request_id=current_in_context_messages[-1].id)
 
         # Create a new user message from the input but dont store it yet
@@ -400,3 +416,19 @@ def _maybe_get_approval_messages(messages: list[Message]) -> Tuple[Message | Non
         if maybe_approval_request.role == "approval" and maybe_approval_response.role == "approval":
             return maybe_approval_request, maybe_approval_response
     return None, None
+
+
+def _maybe_get_pending_tool_call_message(messages: list[Message]) -> Message | None:
+    """
+    Only used in the case where hitl is invoked with parallel tool calling,
+    where agent calls some tools that require approval, and others that don't.
+    """
+    if len(messages) >= 3:
+        maybe_tool_call_message = messages[-3]
+        if (
+            maybe_tool_call_message.role == "assistant"
+            and maybe_tool_call_message.tool_calls is not None
+            and len(maybe_tool_call_message.tool_calls) > 0
+        ):
+            return maybe_tool_call_message
+    return None

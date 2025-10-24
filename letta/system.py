@@ -1,6 +1,9 @@
 import json
-import warnings
 from typing import Optional
+
+from letta.log import get_logger
+
+logger = get_logger(__name__)
 
 from .constants import (
     INITIAL_BOOT_MESSAGE,
@@ -42,11 +45,17 @@ def get_initial_boot_messages(version, timezone, tool_call_id):
             },
             # obligatory function return message
             {
-                # "role": "function",
                 "role": "tool",
                 "name": "send_message",  # NOTE: technically not up to spec, this is old functions style
                 "content": package_function_response(True, None, timezone),
                 "tool_call_id": tool_call_id,
+                "tool_returns": [
+                    {
+                        "tool_call_id": tool_call_id,
+                        "status": "success",
+                        "func_response": package_function_response(True, None, timezone),
+                    }
+                ],
             },
         ]
 
@@ -154,7 +163,7 @@ def package_system_message(system_message, timezone, message_type="system_alert"
     try:
         message_json = json.loads(system_message)
         if "type" in message_json and message_json["type"] == message_type:
-            warnings.warn(f"Attempted to pack a system message that is already packed. Not packing: '{system_message}'")
+            logger.warning(f"Attempted to pack a system message that is already packed. Not packing: '{system_message}'")
             return system_message
     except:
         pass  # do nothing, expected behavior that the message is not JSON
@@ -245,7 +254,7 @@ def unpack_message(packed_message: str) -> str:
         if "type" in message_json and message_json["type"] in ["login", "heartbeat"]:
             # This is a valid user message that the ADE expects, so don't print warning
             return packed_message
-        warnings.warn(f"Was unable to find 'message' field in packed message object: '{packed_message}'")
+        logger.warning(f"Was unable to find 'message' field in packed message object: '{packed_message}'")
         return packed_message
     else:
         try:
@@ -254,6 +263,6 @@ def unpack_message(packed_message: str) -> str:
             return packed_message
 
         if message_type != "user_message":
-            warnings.warn(f"Expected type to be 'user_message', but was '{message_type}', so not unpacking: '{packed_message}'")
+            logger.warning(f"Expected type to be 'user_message', but was '{message_type}', so not unpacking: '{packed_message}'")
             return packed_message
         return message_json.get("message")

@@ -1,17 +1,22 @@
+import asyncio
+from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 
 from letta.helpers.tpuf_client import should_use_tpuf
 from letta.log import get_logger
 from letta.orm import ArchivalPassage, Archive as ArchiveModel, ArchivesAgents
 from letta.otel.tracing import trace_method
+from letta.schemas.agent import AgentState as PydanticAgentState
 from letta.schemas.archive import Archive as PydanticArchive
-from letta.schemas.enums import VectorDBProvider
+from letta.schemas.embedding_config import EmbeddingConfig
+from letta.schemas.enums import PrimitiveType, VectorDBProvider
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
-from letta.settings import settings
+from letta.settings import DatabaseChoice, settings
 from letta.utils import enforce_types
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -24,6 +29,7 @@ class ArchiveManager:
     async def create_archive_async(
         self,
         name: str,
+        embedding_config: EmbeddingConfig,
         description: Optional[str] = None,
         actor: PydanticUser = None,
     ) -> PydanticArchive:
@@ -38,6 +44,7 @@ class ArchiveManager:
                     description=description,
                     organization_id=actor.organization_id,
                     vector_db_provider=vector_db_provider,
+                    embedding_config=embedding_config,
                 )
                 await archive.create_async(session, actor=actor)
                 return archive.to_pydantic()
@@ -47,6 +54,7 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def get_archive_by_id_async(
         self,
         archive_id: str,
@@ -63,6 +71,7 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def update_archive_async(
         self,
         archive_id: str,
@@ -89,6 +98,7 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def list_archives_async(
         self,
         *,
@@ -136,6 +146,8 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def attach_agent_to_archive_async(
         self,
         agent_id: str,
@@ -172,6 +184,34 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    async def detach_agent_from_archive_async(
+        self,
+        agent_id: str,
+        archive_id: str,
+        actor: PydanticUser = None,
+    ) -> None:
+        """Detach an agent from an archive."""
+        async with db_registry.async_session() as session:
+            # Delete the relationship directly
+            result = await session.execute(
+                delete(ArchivesAgents).where(
+                    ArchivesAgents.agent_id == agent_id,
+                    ArchivesAgents.archive_id == archive_id,
+                )
+            )
+
+            if result.rowcount == 0:
+                logger.warning(f"Attempted to detach unattached agent {agent_id} from archive {archive_id}")
+            else:
+                logger.info(f"Detached agent {agent_id} from archive {archive_id}")
+
+            await session.commit()
+
+    @enforce_types
+    @trace_method
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def get_default_archive_for_agent_async(
         self,
         agent_id: str,
@@ -204,6 +244,7 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def delete_archive_async(
         self,
         archive_id: str,
@@ -221,10 +262,49 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @raise_on_invalid_id(param_name="passage_id", expected_prefix=PrimitiveType.PASSAGE)
+    async def delete_passage_from_archive_async(
+        self,
+        archive_id: str,
+        passage_id: str,
+        actor: PydanticUser = None,
+        strict_mode: bool = False,
+    ) -> None:
+        """Delete a passage from an archive.
+
+        Args:
+            archive_id: ID of the archive containing the passage
+            passage_id: ID of the passage to delete
+            actor: User performing the operation
+            strict_mode: If True, raise errors on Turbopuffer failures
+
+        Raises:
+            NoResultFound: If archive or passage not found
+            ValueError: If passage does not belong to the specified archive
+        """
+        from letta.services.passage_manager import PassageManager
+
+        await self.get_archive_by_id_async(archive_id=archive_id, actor=actor)
+
+        passage_manager = PassageManager()
+        passage = await passage_manager.get_agent_passage_by_id_async(passage_id=passage_id, actor=actor)
+
+        if passage.archive_id != archive_id:
+            raise ValueError(f"Passage {passage_id} does not belong to archive {archive_id}")
+
+        await passage_manager.delete_agent_passage_by_id_async(
+            passage_id=passage_id,
+            actor=actor,
+            strict_mode=strict_mode,
+        )
+        logger.info(f"Deleted passage {passage_id} from archive {archive_id}")
+
+    @enforce_types
+    @trace_method
     async def get_or_create_default_archive_for_agent_async(
         self,
-        agent_id: str,
-        agent_name: Optional[str] = None,
+        agent_state: PydanticAgentState,
         actor: PydanticUser = None,
     ) -> PydanticArchive:
         """Get the agent's default archive, creating one if it doesn't exist."""
@@ -236,14 +316,14 @@ class ArchiveManager:
         agent_manager = AgentManager()
 
         archive_ids = await agent_manager.get_agent_archive_ids_async(
-            agent_id=agent_id,
+            agent_id=agent_state.id,
             actor=actor,
         )
 
         if archive_ids:
             # TODO: Remove this check once we support multiple archives per agent
             if len(archive_ids) > 1:
-                raise ValueError(f"Agent {agent_id} has multiple archives, which is not yet supported")
+                raise ValueError(f"Agent {agent_state.id} has multiple archives, which is not yet supported")
             # Get the archive
             archive = await self.get_archive_by_id_async(
                 archive_id=archive_ids[0],
@@ -252,9 +332,10 @@ class ArchiveManager:
             return archive
 
         # Create a default archive for this agent
-        archive_name = f"{agent_name or f'Agent {agent_id}'}'s Archive"
+        archive_name = f"{agent_state.name}'s Archive"
         archive = await self.create_archive_async(
             name=archive_name,
+            embedding_config=agent_state.embedding_config,
             description="Default archive created automatically",
             actor=actor,
         )
@@ -262,7 +343,7 @@ class ArchiveManager:
         try:
             # Attach the agent to the archive as owner
             await self.attach_agent_to_archive_async(
-                agent_id=agent_id,
+                agent_id=agent_state.id,
                 archive_id=archive.id,
                 is_owner=True,
                 actor=actor,
@@ -271,12 +352,12 @@ class ArchiveManager:
         except IntegrityError:
             # race condition: another concurrent request already created and attached an archive
             # clean up the orphaned archive we just created
-            logger.info(f"Race condition detected for agent {agent_id}, cleaning up orphaned archive {archive.id}")
+            logger.info(f"Race condition detected for agent {agent_state.id}, cleaning up orphaned archive {archive.id}")
             await self.delete_archive_async(archive_id=archive.id, actor=actor)
 
             # fetch the existing archive that was created by the concurrent request
             archive_ids = await agent_manager.get_agent_archive_ids_async(
-                agent_id=agent_id,
+                agent_id=agent_state.id,
                 actor=actor,
             )
             if archive_ids:
@@ -291,15 +372,86 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def get_agents_for_archive_async(
         self,
         archive_id: str,
         actor: PydanticUser,
-    ) -> List[str]:
-        """Get all agent IDs that have access to an archive."""
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+        limit: Optional[int] = 50,
+        ascending: bool = False,
+        include: List[str] = [],
+    ) -> List[PydanticAgentState]:
+        """Get agents that have access to an archive with pagination support.
+
+        Uses a subquery approach to avoid expensive JOINs.
+        """
+        from letta.orm import Agent as AgentModel
+
         async with db_registry.async_session() as session:
-            result = await session.execute(select(ArchivesAgents.agent_id).where(ArchivesAgents.archive_id == archive_id))
-            return [row[0] for row in result.fetchall()]
+            # Start with a basic query using subquery instead of JOIN
+            query = (
+                select(AgentModel)
+                .where(AgentModel.id.in_(select(ArchivesAgents.agent_id).where(ArchivesAgents.archive_id == archive_id)))
+                .where(AgentModel.organization_id == actor.organization_id)
+            )
+
+            # Apply pagination using cursor-based approach
+            if after:
+                result = (await session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == after))).first()
+                if result:
+                    after_sort_value, after_id = result
+                    # SQLite does not support as granular timestamping, so we need to round the timestamp
+                    if settings.database_engine is DatabaseChoice.SQLITE and isinstance(after_sort_value, datetime):
+                        after_sort_value = after_sort_value.strftime("%Y-%m-%d %H:%M:%S")
+
+                    if ascending:
+                        query = query.where(
+                            AgentModel.created_at > after_sort_value,
+                            or_(AgentModel.created_at == after_sort_value, AgentModel.id > after_id),
+                        )
+                    else:
+                        query = query.where(
+                            AgentModel.created_at < after_sort_value,
+                            or_(AgentModel.created_at == after_sort_value, AgentModel.id < after_id),
+                        )
+
+            if before:
+                result = (await session.execute(select(AgentModel.created_at, AgentModel.id).where(AgentModel.id == before))).first()
+                if result:
+                    before_sort_value, before_id = result
+                    # SQLite does not support as granular timestamping, so we need to round the timestamp
+                    if settings.database_engine is DatabaseChoice.SQLITE and isinstance(before_sort_value, datetime):
+                        before_sort_value = before_sort_value.strftime("%Y-%m-%d %H:%M:%S")
+
+                    if ascending:
+                        query = query.where(
+                            AgentModel.created_at < before_sort_value,
+                            or_(AgentModel.created_at == before_sort_value, AgentModel.id < before_id),
+                        )
+                    else:
+                        query = query.where(
+                            AgentModel.created_at > before_sort_value,
+                            or_(AgentModel.created_at == before_sort_value, AgentModel.id > before_id),
+                        )
+
+            # Apply sorting
+            if ascending:
+                query = query.order_by(AgentModel.created_at.asc(), AgentModel.id.asc())
+            else:
+                query = query.order_by(AgentModel.created_at.desc(), AgentModel.id.desc())
+
+            # Apply limit
+            if limit:
+                query = query.limit(limit)
+
+            # Execute the query
+            result = await session.execute(query)
+            agents_orm = result.scalars().all()
+
+            agents = await asyncio.gather(*[agent.to_pydantic_async(include_relationships=[], include=include) for agent in agents_orm])
+            return agents
 
     @enforce_types
     @trace_method
@@ -333,6 +485,7 @@ class ArchiveManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     async def get_or_set_vector_db_namespace_async(
         self,
         archive_id: str,

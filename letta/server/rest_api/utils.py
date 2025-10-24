@@ -3,7 +3,7 @@ import json
 import os
 import uuid
 from enum import Enum
-from typing import AsyncGenerator, Dict, Iterable, List, Optional, Union, cast
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Union, cast
 
 from fastapi import Header, HTTPException
 from openai.types.chat import ChatCompletionMessageParam
@@ -27,6 +27,7 @@ from letta.otel.metric_registry import MetricRegistry
 from letta.otel.tracing import tracer
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import MessageRole
+from letta.schemas.letta_message import ToolReturn as LettaToolReturn
 from letta.schemas.letta_message_content import (
     OmittedReasoningContent,
     ReasoningContent,
@@ -120,7 +121,7 @@ async def sse_async_generator(
                     err_msg = f"Expected LettaUsageStatistics, got {type(usage)}"
                     logger.error(err_msg)
                     raise ValueError(err_msg)
-                yield sse_formatter(usage.model_dump(exclude={"steps_messages"}))
+                yield sse_formatter(usage.model_dump())
 
             except ContextWindowExceededError as e:
                 capture_sentry_exception(e)
@@ -168,7 +169,23 @@ def create_input_messages(input_messages: List[MessageCreate], agent_id: str, ti
     return messages
 
 
-def create_approval_response_message_from_input(agent_state: AgentState, input_message: ApprovalCreate) -> List[Message]:
+def create_approval_response_message_from_input(
+    agent_state: AgentState, input_message: ApprovalCreate, run_id: Optional[str] = None
+) -> List[Message]:
+    def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
+        if isinstance(maybe_tool_return, LettaToolReturn):
+            packaged_function_response = package_function_response(
+                maybe_tool_return.status == "success", maybe_tool_return.tool_return, agent_state.timezone
+            )
+            return ToolReturn(
+                tool_call_id=maybe_tool_return.tool_call_id,
+                status=maybe_tool_return.status,
+                func_response=packaged_function_response,
+                stdout=maybe_tool_return.stdout,
+                stderr=maybe_tool_return.stderr,
+            )
+        return maybe_tool_return
+
     return [
         Message(
             role=MessageRole.approval,
@@ -177,6 +194,8 @@ def create_approval_response_message_from_input(agent_state: AgentState, input_m
             approval_request_id=input_message.approval_request_id,
             approve=input_message.approve,
             denial_reason=input_message.reason,
+            approvals=[maybe_convert_tool_return_message(approval) for approval in input_message.approvals],
+            run_id=run_id,
         )
     ]
 
@@ -184,45 +203,77 @@ def create_approval_response_message_from_input(agent_state: AgentState, input_m
 def create_approval_request_message_from_llm_response(
     agent_id: str,
     model: str,
-    function_name: str,
-    function_arguments: Dict,
-    tool_call_id: str,
-    actor: User,
-    continue_stepping: bool = False,
+    requested_tool_calls: List[OpenAIToolCall],
+    allowed_tool_calls: List[OpenAIToolCall] = [],
     reasoning_content: Optional[List[Union[TextContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent]]] = None,
     pre_computed_assistant_message_id: Optional[str] = None,
     step_id: str | None = None,
     run_id: str = None,
-    append_request_heartbeat: bool = True,
 ) -> Message:
+    messages = []
+    if allowed_tool_calls:
+        oai_tool_calls = [
+            OpenAIToolCall(
+                id=tool_call.id,
+                function=OpenAIFunction(
+                    name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                ),
+                type="function",
+            )
+            for tool_call in allowed_tool_calls
+        ]
+        tool_message = Message(
+            role=MessageRole.assistant,
+            content=reasoning_content if reasoning_content else [],
+            agent_id=agent_id,
+            model=model,
+            tool_calls=oai_tool_calls,
+            tool_call_id=allowed_tool_calls[0].id,
+            created_at=get_utc_time(),
+            step_id=step_id,
+            run_id=run_id,
+        )
+        if pre_computed_assistant_message_id:
+            tool_message.id = pre_computed_assistant_message_id
+        messages.append(tool_message)
     # Construct the tool call with the assistant's message
-    # Optionally set request_heartbeat in tool args (v2 behavior only)
-    if append_request_heartbeat:
-        function_arguments[REQUEST_HEARTBEAT_PARAM] = continue_stepping
-    tool_call = OpenAIToolCall(
-        id=tool_call_id,
-        function=OpenAIFunction(
-            name=function_name,
-            arguments=json.dumps(function_arguments),
-        ),
-        type="function",
-    )
+    oai_tool_calls = [
+        OpenAIToolCall(
+            id=tool_call.id,
+            function=OpenAIFunction(
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+            ),
+            type="function",
+        )
+        for tool_call in requested_tool_calls
+    ]
     # TODO: Use ToolCallContent instead of tool_calls
     # TODO: This helps preserve ordering
     approval_message = Message(
         role=MessageRole.approval,
-        content=reasoning_content if reasoning_content else [],
+        content=reasoning_content if reasoning_content and not allowed_tool_calls else [],
         agent_id=agent_id,
         model=model,
-        tool_calls=[tool_call],
-        tool_call_id=tool_call_id,
+        tool_calls=oai_tool_calls,
+        tool_call_id=oai_tool_calls[0].id,
         created_at=get_utc_time(),
         step_id=step_id,
         run_id=run_id,
     )
     if pre_computed_assistant_message_id:
-        approval_message.id = pre_computed_assistant_message_id
-    return approval_message
+        approval_message.id = decrement_message_uuid(pre_computed_assistant_message_id)
+    messages.append(approval_message)
+    return messages
+
+
+def decrement_message_uuid(message_id: str):
+    message_uuid = uuid.UUID(message_id.split("-", maxsplit=1)[1])
+    uuid_as_int = message_uuid.int
+    decremented_int = uuid_as_int - 1
+    decremented_uuid = uuid.UUID(int=decremented_int)
+    return "message-" + str(decremented_uuid)
 
 
 def create_letta_messages_from_llm_response(
@@ -358,6 +409,117 @@ def create_letta_messages_from_llm_response(
     for message in messages:
         message.step_id = step_id
 
+    return messages
+
+
+def create_parallel_tool_messages_from_llm_response(
+    agent_id: str,
+    model: str,
+    tool_call_specs: List[Dict[str, Any]],  # List of tool call specs: {"name": str, "arguments": Dict, "id": Optional[str]}
+    tool_execution_results: List[ToolExecutionResult],
+    function_responses: List[Optional[str]],
+    timezone: str,
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+    reasoning_content: Optional[
+        List[Union[TextContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent | SummarizedReasoningContent]]
+    ] = None,
+    pre_computed_assistant_message_id: Optional[str] = None,
+    llm_batch_item_id: Optional[str] = None,
+    is_approval_response: bool = False,
+    tool_returns: List[ToolReturn] = [],
+) -> List[Message]:
+    """
+    Build two messages representing a parallel tool-call step:
+    - One assistant message with ALL tool_calls populated (tool_call_id left empty)
+    - One tool message with ALL tool_returns populated (tool_call_id left empty)
+
+    Notes:
+    - Consumers should read tool_calls/tool_returns arrays for per-call details.
+    - The tool message's content includes only the first call's packaged response for
+      backward-compatibility with legacy renderers. UIs should prefer tool_returns.
+    - When invoked for an approval response, the assistant message is omitted (the approval
+      tool call was previously surfaced).
+    """
+
+    # Construct OpenAI-style tool_calls for the assistant message
+    openai_tool_calls: List[OpenAIToolCall] = []
+    for spec in tool_call_specs:
+        name = spec.get("name")
+        args = spec.get("arguments", {})
+        call_id = spec.get("id") or str(uuid.uuid4())
+        # Ensure the spec carries the resolved id so returns/content can reference it
+        if not spec.get("id"):
+            spec["id"] = call_id
+        openai_tool_calls.append(
+            OpenAIToolCall(
+                id=call_id,
+                function=OpenAIFunction(name=name, arguments=json.dumps(args)),
+                type="function",
+            )
+        )
+
+    messages: List[Message] = []
+
+    if not is_approval_response:
+        # Assistant message with all tool_calls (no single tool_call_id)
+        # Safeguard against empty text messages
+        content: List[
+            Union[TextContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent, SummarizedReasoningContent]
+        ] = []
+        if reasoning_content:
+            for content_part in reasoning_content:
+                if isinstance(content_part, TextContent) and content_part.text == "":
+                    continue
+                content.append(content_part)
+
+        assistant_message = Message(
+            role=MessageRole.assistant,
+            content=content,
+            agent_id=agent_id,
+            model=model,
+            tool_calls=openai_tool_calls,
+            tool_call_id=None,
+            created_at=get_utc_time(),
+            batch_item_id=llm_batch_item_id,
+            run_id=run_id,
+        )
+        if step_id:
+            assistant_message.step_id = step_id
+        if pre_computed_assistant_message_id:
+            assistant_message.id = pre_computed_assistant_message_id
+        messages.append(assistant_message)
+
+    content: List[TextContent] = []
+    for spec, exec_result, response in zip(tool_call_specs, tool_execution_results, function_responses):
+        packaged = package_function_response(exec_result.success_flag, response, timezone)
+        content.append(TextContent(text=packaged))
+        tool_returns.append(
+            ToolReturn(
+                tool_call_id=spec.get("id"),
+                status=exec_result.status,
+                stdout=exec_result.stdout,
+                stderr=exec_result.stderr,
+                func_response=packaged,
+            )
+        )
+
+    tool_message = Message(
+        role=MessageRole.tool,
+        content=content,
+        agent_id=agent_id,
+        model=model,
+        tool_calls=[],
+        tool_call_id=tool_returns[0].tool_call_id,  # For legacy reasons, set to first one
+        created_at=get_utc_time(),
+        batch_item_id=llm_batch_item_id,
+        tool_returns=tool_returns,
+        run_id=run_id,
+    )
+    if step_id:
+        tool_message.step_id = step_id
+
+    messages.append(tool_message)
     return messages
 
 

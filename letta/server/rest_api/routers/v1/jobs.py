@@ -1,13 +1,14 @@
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 
-from letta.orm.errors import NoResultFound
+from letta.errors import LettaInvalidArgumentError
 from letta.schemas.enums import JobStatus
-from letta.schemas.job import Job
+from letta.schemas.job import Job, JobBase
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.server.server import SyncServer
 from letta.settings import settings
+from letta.validators import JobId
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -88,7 +89,7 @@ async def list_active_jobs(
 
 @router.get("/{job_id}", response_model=Job, operation_id="retrieve_job")
 async def retrieve_job(
-    job_id: str,
+    job_id: JobId,
     headers: HeaderParams = Depends(get_headers),
     server: "SyncServer" = Depends(get_letta_server),
 ):
@@ -96,16 +97,12 @@ async def retrieve_job(
     Get the status of a job.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-
-    try:
-        return await server.job_manager.get_job_by_id_async(job_id=job_id, actor=actor)
-    except NoResultFound:
-        raise HTTPException(status_code=404, detail="Job not found")
+    return await server.job_manager.get_job_by_id_async(job_id=job_id, actor=actor)
 
 
 @router.patch("/{job_id}/cancel", response_model=Job, operation_id="cancel_job")
 async def cancel_job(
-    job_id: str,
+    job_id: JobId,
     headers: HeaderParams = Depends(get_headers),
     server: "SyncServer" = Depends(get_letta_server),
 ):
@@ -117,24 +114,20 @@ async def cancel_job(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     if not settings.track_agent_run:
-        raise HTTPException(status_code=400, detail="Agent run tracking is disabled")
+        raise LettaInvalidArgumentError("Agent run tracking is disabled")
 
-    try:
-        # First check if the job exists and is in a cancellable state
-        existing_job = await server.job_manager.get_job_by_id_async(job_id=job_id, actor=actor)
+    # First check if the job exists and is in a cancellable state
+    existing_job = await server.job_manager.get_job_by_id_async(job_id=job_id, actor=actor)
 
-        if existing_job.status.is_terminal:
-            return False
+    if existing_job.status.is_terminal:
+        return False
 
-        return await server.job_manager.safe_update_job_status_async(job_id=job_id, new_status=JobStatus.cancelled, actor=actor)
-
-    except NoResultFound:
-        raise HTTPException(status_code=404, detail="Job not found")
+    return await server.job_manager.safe_update_job_status_async(job_id=job_id, new_status=JobStatus.cancelled, actor=actor)
 
 
 @router.delete("/{job_id}", response_model=Job, operation_id="delete_job")
 async def delete_job(
-    job_id: str,
+    job_id: JobId,
     headers: HeaderParams = Depends(get_headers),
     server: "SyncServer" = Depends(get_letta_server),
 ):
@@ -142,9 +135,4 @@ async def delete_job(
     Delete a job by its job_id.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-
-    try:
-        job = await server.job_manager.delete_job_by_id_async(job_id=job_id, actor=actor)
-        return job
-    except NoResultFound:
-        raise HTTPException(status_code=404, detail="Job not found")
+    return await server.job_manager.delete_job_by_id_async(job_id=job_id, actor=actor)

@@ -241,7 +241,9 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "tools": [],
             "sources": [],
             "memory": Memory(blocks=[]),
+            "blocks": [],
             "identity_ids": [],
+            "identities": [],
             "multi_agent_group": None,
             "tool_exec_environment_variables": [],
             "secrets": [],
@@ -262,8 +264,11 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
                 ],
                 agent_type=self.agent_type,
             ),
+            "blocks": lambda: [b.to_pydantic() for b in self.core_memory],
             "identity_ids": lambda: [i.id for i in self.identities],
+            "identities": lambda: [i.to_pydantic() for i in self.identities],  # TODO: fix this
             "multi_agent_group": lambda: self.multi_agent_group,
+            "managed_group": lambda: self.multi_agent_group,
             "tool_exec_environment_variables": lambda: self.tool_exec_environment_variables,
             "secrets": lambda: self.tool_exec_environment_variables,
         }
@@ -277,7 +282,11 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
 
         return self.__pydantic_model__(**state)
 
-    async def to_pydantic_async(self, include_relationships: Optional[Set[str]] = None) -> PydanticAgentState:
+    async def to_pydantic_async(
+        self,
+        include_relationships: Optional[Set[str]] = None,
+        include: Optional[List[str]] = None,
+    ) -> PydanticAgentState:
         """
         Converts the SQLAlchemy Agent model into its Pydantic counterpart.
 
@@ -334,14 +343,20 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "tools": [],
             "sources": [],
             "memory": Memory(blocks=[]),
+            "blocks": [],
             "identity_ids": [],
+            "identities": [],
             "multi_agent_group": None,
+            "managed_group": None,
             "tool_exec_environment_variables": [],
             "secrets": [],
         }
 
         # Initialize include_relationships to an empty set if it's None
         include_relationships = set(optional_fields.keys() if include_relationships is None else include_relationships)
+
+        # Convert include list to set for efficient membership checks
+        include_set = set(include) if include else set()
 
         async def empty_list_async():
             return []
@@ -350,18 +365,34 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             return None
 
         # Only load requested relationships
-        tags = self.awaitable_attrs.tags if "tags" in include_relationships else empty_list_async()
-        tools = self.awaitable_attrs.tools if "tools" in include_relationships else empty_list_async()
-        sources = self.awaitable_attrs.sources if "sources" in include_relationships else empty_list_async()
-        memory = self.awaitable_attrs.core_memory if "memory" in include_relationships else empty_list_async()
-        identities = self.awaitable_attrs.identities if "identity_ids" in include_relationships else empty_list_async()
-        multi_agent_group = self.awaitable_attrs.multi_agent_group if "multi_agent_group" in include_relationships else none_async()
-        tool_exec_environment_variables = (
-            self.awaitable_attrs.tool_exec_environment_variables
-            if "tool_exec_environment_variables" in include_relationships or "secrets" in include_relationships
+        tags = self.awaitable_attrs.tags if "tags" in include_relationships or "agent.tags" in include_set else empty_list_async()
+        tools = self.awaitable_attrs.tools if "tools" in include_relationships or "agent.tools" in include_set else empty_list_async()
+        sources = (
+            self.awaitable_attrs.sources if "sources" in include_relationships or "agent.sources" in include_set else empty_list_async()
+        )
+        memory = (
+            self.awaitable_attrs.core_memory if "memory" in include_relationships or "agent.blocks" in include_set else empty_list_async()
+        )
+        identities = (
+            self.awaitable_attrs.identities
+            if "identity_ids" in include_relationships or "agent.identities" in include_set
             else empty_list_async()
         )
-        file_agents = self.awaitable_attrs.file_agents if "memory" in include_relationships else empty_list_async()
+        multi_agent_group = (
+            self.awaitable_attrs.multi_agent_group
+            if "multi_agent_group" in include_relationships or "agent.managed_group" in include_set
+            else none_async()
+        )
+        tool_exec_environment_variables = (
+            self.awaitable_attrs.tool_exec_environment_variables
+            if "tool_exec_environment_variables" in include_relationships
+            or "secrets" in include_relationships
+            or "agent.secrets" in include_set
+            else empty_list_async()
+        )
+        file_agents = (
+            self.awaitable_attrs.file_agents if "memory" in include_relationships or "agent.blocks" in include_set else empty_list_async()
+        )
 
         (tags, tools, sources, memory, identities, multi_agent_group, tool_exec_environment_variables, file_agents) = await asyncio.gather(
             tags, tools, sources, memory, identities, multi_agent_group, tool_exec_environment_variables, file_agents
@@ -379,8 +410,11 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             ],
             agent_type=self.agent_type,
         )
+        state["blocks"] = [m.to_pydantic() for m in memory]
         state["identity_ids"] = [i.id for i in identities]
+        state["identities"] = [i.to_pydantic() for i in identities]
         state["multi_agent_group"] = multi_agent_group
+        state["managed_group"] = multi_agent_group
         state["tool_exec_environment_variables"] = tool_exec_environment_variables
         state["secrets"] = tool_exec_environment_variables
 

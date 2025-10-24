@@ -134,6 +134,7 @@ async def test_add_mcp_tool_accepts_non_strict_schemas():
             assert call_args.kwargs["mcp_server_name"] == "test_server"
 
 
+@pytest.mark.skip(reason="Allowing invalid schemas to be attached")
 @pytest.mark.asyncio
 async def test_add_mcp_tool_rejects_invalid_schemas():
     """Test that adding MCP tools with invalid schemas is rejected."""
@@ -236,8 +237,12 @@ def test_mcp_schema_healing_with_anyof():
     assert strict_schema["strict"] is True
     assert "a" in strict_schema["parameters"]["required"]
     assert "b" in strict_schema["parameters"]["required"]  # Now required
-    # Type should be flattened array with deduplication
-    assert set(strict_schema["parameters"]["properties"]["b"]["type"]) == {"integer", "null"}
+    # anyOf should be preserved with integer and null types
+    b_prop = strict_schema["parameters"]["properties"]["b"]
+    assert "anyOf" in b_prop
+    assert len(b_prop["anyOf"]) == 2
+    types_in_anyof = {opt.get("type") for opt in b_prop["anyOf"]}
+    assert types_in_anyof == {"integer", "null"}
 
     # Validate strict schema
     status, _ = validate_complete_json_schema(strict_schema["parameters"])
@@ -245,7 +250,7 @@ def test_mcp_schema_healing_with_anyof():
 
 
 def test_mcp_schema_type_deduplication():
-    """Test that duplicate types are deduplicated in schema generation."""
+    """Test that anyOf duplicates are removed in schema generation."""
     mcp_tool = MCPTool(
         name="test_tool",
         description="A test tool",
@@ -269,10 +274,14 @@ def test_mcp_schema_type_deduplication():
     # Generate strict schema
     strict_schema = generate_tool_schema_for_mcp(mcp_tool, append_heartbeat=False, strict=True)
 
-    # Check that duplicates were removed
-    field_types = strict_schema["parameters"]["properties"]["field"]["type"]
-    assert len(field_types) == len(set(field_types))  # No duplicates
-    assert set(field_types) == {"string", "null"}
+    # Check that anyOf is preserved but duplicates are removed
+    field_prop = strict_schema["parameters"]["properties"]["field"]
+    assert "anyOf" in field_prop
+    types_in_anyof = [opt.get("type") for opt in field_prop["anyOf"]]
+    # Duplicates should be removed
+    assert len(types_in_anyof) == 2  # Deduplicated to 2 entries
+    assert types_in_anyof.count("string") == 1  # Only one string entry
+    assert types_in_anyof.count("null") == 1  # One null entry
 
 
 def test_mcp_schema_healing_preserves_existing_null():
@@ -332,7 +341,7 @@ def test_mcp_schema_healing_all_fields_already_required():
 
 
 def test_mcp_schema_with_uuid_format():
-    """Test handling of UUID format in anyOf schemas (root cause of duplicate string types)."""
+    """Test handling of UUID format in anyOf schemas (deduplicates but keeps format)."""
     mcp_tool = MCPTool(
         name="test_tool",
         description="A test tool with UUID formatted field",
@@ -352,11 +361,17 @@ def test_mcp_schema_with_uuid_format():
     # Generate strict schema
     strict_schema = generate_tool_schema_for_mcp(mcp_tool, append_heartbeat=False, strict=True)
 
-    # Check that string type is not duplicated
+    # Check that anyOf is preserved with deduplication
     session_props = strict_schema["parameters"]["properties"]["session_id"]
-    assert set(session_props["type"]) == {"string", "null"}  # No duplicate strings
-    # Format should NOT be preserved because field is optional (has null type)
-    assert "format" not in session_props
+    assert "anyOf" in session_props
+    # Deduplication should keep the string with format (more specific)
+    assert len(session_props["anyOf"]) == 2  # Deduplicated: string (with format) + null
+    types_in_anyof = [opt.get("type") for opt in session_props["anyOf"]]
+    assert types_in_anyof.count("string") == 1  # Only one string entry (the one with format)
+    assert "null" in types_in_anyof
+    # Verify the string entry has the uuid format
+    string_entry = next(opt for opt in session_props["anyOf"] if opt.get("type") == "string")
+    assert string_entry.get("format") == "uuid", "UUID format should be preserved"
 
     # Should be in required array (healed)
     assert "session_id" in strict_schema["parameters"]["required"]
@@ -407,7 +422,7 @@ def test_mcp_schema_healing_only_in_strict_mode():
 
 
 def test_mcp_schema_with_uuid_format_required_field():
-    """Test that UUID format is preserved for required fields that don't have null type."""
+    """Test that UUID format is preserved and duplicates are removed for required fields."""
     mcp_tool = MCPTool(
         name="test_tool",
         description="A test tool with required UUID formatted field",
@@ -427,15 +442,380 @@ def test_mcp_schema_with_uuid_format_required_field():
     # Generate strict schema
     strict_schema = generate_tool_schema_for_mcp(mcp_tool, append_heartbeat=False, strict=True)
 
-    # Check that string type is not duplicated and format IS preserved
+    # Check that anyOf is deduplicated, keeping the more specific version
     session_props = strict_schema["parameters"]["properties"]["session_id"]
-    assert session_props["type"] == ["string"]  # No null, no duplicates
-    assert "format" in session_props
-    assert session_props["format"] == "uuid"  # Format should be preserved for non-optional field
+    assert "anyOf" in session_props
+    # Deduplication should keep only the string with format (more specific)
+    assert len(session_props["anyOf"]) == 1  # Deduplicated to 1 entry
+    types_in_anyof = [opt.get("type") for opt in session_props["anyOf"]]
+    assert types_in_anyof.count("string") == 1  # Only one string entry
+    assert "null" not in types_in_anyof  # No null since it's required
+    # UUID format should be preserved
+    string_entry = session_props["anyOf"][0]
+    assert string_entry.get("type") == "string"
+    assert string_entry.get("format") == "uuid", "UUID format should be preserved"
 
     # Should be in required array
     assert "session_id" in strict_schema["parameters"]["required"]
 
     # Should be strict compliant
     status, _ = validate_complete_json_schema(strict_schema["parameters"])
+    assert status == SchemaHealth.STRICT_COMPLIANT
+
+
+def test_mcp_schema_complex_nested_with_defs():
+    """Test generating exact schema with nested Pydantic-like models using $defs."""
+    import json
+
+    from letta.functions.mcp_client.types import MCPToolHealth
+
+    mcp_tool = MCPTool(
+        name="get_vehicle_configuration",
+        description="Get vehicle configuration details for a given model type and optional dealer info and customization options.\n\nArgs:\n    model_type (VehicleModel): The vehicle model type selection.\n    dealer_location (str | None): Dealer location identifier from registration system, if available.\n    customization_options (CustomizationData | None): Customization preferences for the vehicle from user selections, if available.\n\nReturns:\n    str: The vehicle configuration details.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "model_type": {
+                    "$ref": "#/$defs/VehicleModel",
+                    "description": "The vehicle model type selection.",
+                    "title": "Model Type",
+                },
+                "dealer_location": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                    "description": "Dealer location identifier from registration system, if available.",
+                    "title": "Dealer Location",
+                },
+                "customization_options": {
+                    "anyOf": [{"$ref": "#/$defs/CustomizationData"}, {"type": "null"}],
+                    "default": None,
+                    "description": "Customization preferences for the vehicle from user selections, if available.",
+                    "title": "Customization Options",
+                },
+            },
+            "required": ["model_type"],
+            "additionalProperties": False,
+            "$defs": {
+                "VehicleModel": {
+                    "type": "string",
+                    "enum": [
+                        "sedan",
+                        "suv",
+                        "truck",
+                        "coupe",
+                        "hatchback",
+                        "minivan",
+                        "wagon",
+                        "convertible",
+                        "sports",
+                        "luxury",
+                        "electric",
+                        "hybrid",
+                        "compact",
+                        "crossover",
+                        "other",
+                        "unknown",
+                    ],
+                    "title": "VehicleModel",
+                },
+                "Feature": {
+                    "type": "object",
+                    "properties": {
+                        "feature_id": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Feature ID",
+                        },
+                        "category_code": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Category Code",
+                        },
+                        "variant_code": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Variant Code",
+                        },
+                        "package_level": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Package Level",
+                        },
+                    },
+                    "title": "Feature",
+                    "additionalProperties": False,
+                },
+                "CustomizationData": {
+                    "type": "object",
+                    "properties": {
+                        "has_premium_package": {
+                            "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Has Premium Package",
+                        },
+                        "has_multiple_trims": {
+                            "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Has Multiple Trims",
+                        },
+                        "selected_features": {
+                            "anyOf": [
+                                {"type": "array", "items": {"$ref": "#/$defs/Feature"}},
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                            "title": "Selected Features",
+                        },
+                    },
+                    "title": "CustomizationData",
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+    # Initialize health status to simulate what happens in the server
+    mcp_tool.health = MCPToolHealth(status=SchemaHealth.STRICT_COMPLIANT.value, reasons=[])
+
+    # Generate schema with heartbeat
+    schema = generate_tool_schema_for_mcp(mcp_tool, append_heartbeat=True, strict=False)
+
+    # Add metadata fields (these are normally added by ToolCreate.from_mcp)
+    from letta.schemas.tool import MCP_TOOL_METADATA_SCHEMA_STATUS, MCP_TOOL_METADATA_SCHEMA_WARNINGS
+
+    schema[MCP_TOOL_METADATA_SCHEMA_STATUS] = mcp_tool.health.status
+    schema[MCP_TOOL_METADATA_SCHEMA_WARNINGS] = mcp_tool.health.reasons
+
+    # Expected schema
+    expected_schema = {
+        "name": "get_vehicle_configuration",
+        "description": "Get vehicle configuration details for a given model type and optional dealer info and customization options.\n\nArgs:\n    model_type (VehicleModel): The vehicle model type selection.\n    dealer_location (str | None): Dealer location identifier from registration system, if available.\n    customization_options (CustomizationData | None): Customization preferences for the vehicle from user selections, if available.\n\nReturns:\n    str: The vehicle configuration details.",
+        "parameters": {
+            "$defs": {
+                "Feature": {
+                    "properties": {
+                        "feature_id": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Feature ID",
+                        },
+                        "category_code": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Category Code",
+                        },
+                        "variant_code": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Variant Code",
+                        },
+                        "package_level": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Package Level",
+                        },
+                    },
+                    "title": "Feature",
+                    "type": "object",
+                    "additionalProperties": False,
+                },
+                "CustomizationData": {
+                    "properties": {
+                        "has_premium_package": {
+                            "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Has Premium Package",
+                        },
+                        "has_multiple_trims": {
+                            "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                            "default": None,
+                            "title": "Has Multiple Trims",
+                        },
+                        "selected_features": {
+                            "anyOf": [
+                                {"items": {"$ref": "#/$defs/Feature"}, "type": "array"},
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                            "title": "Selected Features",
+                        },
+                    },
+                    "title": "CustomizationData",
+                    "type": "object",
+                    "additionalProperties": False,
+                },
+                "VehicleModel": {
+                    "enum": [
+                        "sedan",
+                        "suv",
+                        "truck",
+                        "coupe",
+                        "hatchback",
+                        "minivan",
+                        "wagon",
+                        "convertible",
+                        "sports",
+                        "luxury",
+                        "electric",
+                        "hybrid",
+                        "compact",
+                        "crossover",
+                        "other",
+                        "unknown",
+                    ],
+                    "title": "VehicleModel",
+                    "type": "string",
+                },
+            },
+            "properties": {
+                "model_type": {
+                    "$ref": "#/$defs/VehicleModel",
+                    "description": "The vehicle model type selection.",
+                    "title": "Model Type",
+                    "type": "string",
+                },
+                "dealer_location": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                    "description": "Dealer location identifier from registration system, if available.",
+                    "title": "Dealer Location",
+                },
+                "customization_options": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "title": "CustomizationData",
+                            "additionalProperties": False,
+                            "properties": {
+                                "has_premium_package": {
+                                    "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                                    "default": None,
+                                    "title": "Has Premium Package",
+                                },
+                                "has_multiple_trims": {
+                                    "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                                    "default": None,
+                                    "title": "Has Multiple Trims",
+                                },
+                                "selected_features": {
+                                    "anyOf": [
+                                        {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "title": "Feature",
+                                                "additionalProperties": False,
+                                                "properties": {
+                                                    "feature_id": {
+                                                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                                                        "default": None,
+                                                        "title": "Feature ID",
+                                                    },
+                                                    "category_code": {
+                                                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                                                        "default": None,
+                                                        "title": "Category Code",
+                                                    },
+                                                    "variant_code": {
+                                                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                                                        "default": None,
+                                                        "title": "Variant Code",
+                                                    },
+                                                    "package_level": {
+                                                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                                                        "default": None,
+                                                        "title": "Package Level",
+                                                    },
+                                                },
+                                            },
+                                        },
+                                        {"type": "null"},
+                                    ],
+                                    "default": None,
+                                    "title": "Selected Features",
+                                },
+                            },
+                        },
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                    "description": "Customization preferences for the vehicle from user selections, if available.",
+                    "title": "Customization Options",
+                },
+                "request_heartbeat": {
+                    "type": "boolean",
+                    "description": "Request an immediate heartbeat after function execution. You MUST set this value to `True` if you want to send a follow-up message or run a follow-up tool call (chain multiple tools together). If set to `False` (the default), then the chain of execution will end immediately after this function call.",
+                },
+            },
+            "required": ["model_type", "request_heartbeat"],
+            "type": "object",
+            "additionalProperties": False,
+        },
+        "mcp:SCHEMA_STATUS": "STRICT_COMPLIANT",
+        "mcp:SCHEMA_WARNINGS": [],
+    }
+
+    # Compare key components
+    assert schema["name"] == expected_schema["name"]
+    assert schema["description"] == expected_schema["description"]
+    assert schema["parameters"]["type"] == expected_schema["parameters"]["type"]
+    assert schema["parameters"]["additionalProperties"] == expected_schema["parameters"]["additionalProperties"]
+    assert set(schema["parameters"]["required"]) == set(expected_schema["parameters"]["required"])
+
+    # Check $defs
+    assert "$defs" in schema["parameters"]
+    assert set(schema["parameters"]["$defs"].keys()) == set(expected_schema["parameters"]["$defs"].keys())
+
+    # Check properties
+    assert "model_type" in schema["parameters"]["properties"]
+    assert "dealer_location" in schema["parameters"]["properties"]
+    assert "customization_options" in schema["parameters"]["properties"]
+    assert "request_heartbeat" in schema["parameters"]["properties"]
+
+    # Verify model_type property ($ref is inlined)
+    model_prop = schema["parameters"]["properties"]["model_type"]
+    assert model_prop["type"] == "string"
+    assert "enum" in model_prop, "$ref should be inlined with enum values"
+    assert model_prop["description"] == "The vehicle model type selection."
+
+    # Verify dealer_location property (anyOf preserved)
+    dl_prop = schema["parameters"]["properties"]["dealer_location"]
+    assert "anyOf" in dl_prop, "anyOf should be preserved for optional primitives"
+    assert len(dl_prop["anyOf"]) == 2
+    types_in_anyof = {opt.get("type") for opt in dl_prop["anyOf"]}
+    assert types_in_anyof == {"string", "null"}
+    assert dl_prop["description"] == "Dealer location identifier from registration system, if available."
+
+    # Verify customization_options property (anyOf with fully inlined $refs)
+    co_prop = schema["parameters"]["properties"]["customization_options"]
+    assert "anyOf" in co_prop, "Should use anyOf structure"
+    assert len(co_prop["anyOf"]) == 2, "Should have object and null options"
+
+    # Find the object option in anyOf
+    object_option = next((opt for opt in co_prop["anyOf"] if opt.get("type") == "object"), None)
+    assert object_option is not None, "Should have object type in anyOf"
+    assert object_option["additionalProperties"] is False, "Object must have additionalProperties: false"
+    assert "properties" in object_option, "$ref should be fully inlined with properties"
+
+    # Verify the inlined properties are present
+    assert "has_premium_package" in object_option["properties"]
+    assert "has_multiple_trims" in object_option["properties"]
+    assert "selected_features" in object_option["properties"]
+
+    # Verify nested selected_features array has inlined Feature objects
+    features_prop = object_option["properties"]["selected_features"]
+    assert "anyOf" in features_prop, "selected_features should have anyOf"
+    array_option = next((opt for opt in features_prop["anyOf"] if opt.get("type") == "array"), None)
+    assert array_option is not None
+    assert "items" in array_option
+    assert array_option["items"]["type"] == "object"
+    assert array_option["items"]["additionalProperties"] is False
+    assert "feature_id" in array_option["items"]["properties"]
+    assert "category_code" in array_option["items"]["properties"]
+
+    # Verify metadata fields
+    assert schema[MCP_TOOL_METADATA_SCHEMA_STATUS] == "STRICT_COMPLIANT"
+    assert schema[MCP_TOOL_METADATA_SCHEMA_WARNINGS] == []
+
+    # Should be strict compliant
+    status, _ = validate_complete_json_schema(schema["parameters"])
     assert status == SchemaHealth.STRICT_COMPLIANT

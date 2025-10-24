@@ -853,3 +853,590 @@ async def test_list_agents_ordering_and_pagination(server: SyncServer, default_u
     before_alpha_desc = await server.agent_manager.list_agents_async(actor=default_user, before=agent_ids["alpha_agent"], ascending=False)
     before_names_desc = [a.name for a in before_alpha_desc]
     assert before_names_desc == ["gamma_agent", "beta_agent"]
+
+
+# ======================================================================================================================
+# AgentManager Tests - Environment Variable Encryption
+# ======================================================================================================================
+
+
+@pytest.fixture
+def encryption_key():
+    """Fixture to ensure encryption key is set for tests."""
+    original_key = settings.encryption_key
+    # Set a test encryption key if not already set
+    if not settings.encryption_key:
+        settings.encryption_key = "test-encryption-key-32-bytes!!"
+    yield settings.encryption_key
+    # Restore original
+    settings.encryption_key = original_key
+
+
+@pytest.mark.asyncio
+async def test_agent_environment_variables_encrypt_on_create(server: SyncServer, default_user, encryption_key):
+    """Test that creating an agent with secrets encrypts the values in the database."""
+    from letta.orm.sandbox_config import AgentEnvironmentVariable as AgentEnvironmentVariableModel
+    from letta.schemas.secret import Secret
+
+    # Create agent with secrets
+    agent_create = CreateAgent(
+        name="test-agent-with-secrets",
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=DEFAULT_EMBEDDING_CONFIG,
+        include_base_tools=False,
+        secrets={
+            "API_KEY": "sk-test-secret-12345",
+            "DATABASE_URL": "postgres://user:pass@localhost/db",
+        },
+    )
+
+    created_agent = await server.agent_manager.create_agent_async(agent_create, actor=default_user)
+
+    # Verify agent has secrets
+    assert created_agent.secrets is not None
+    assert len(created_agent.secrets) == 2
+
+    # Verify secrets are AgentEnvironmentVariable objects with Secret fields
+    for secret_obj in created_agent.secrets:
+        assert secret_obj.key in ["API_KEY", "DATABASE_URL"]
+        assert secret_obj.value_enc is not None
+        assert isinstance(secret_obj.value_enc, Secret)
+
+    # Verify values are encrypted in the database
+    async with db_registry.async_session() as session:
+        env_vars = await session.execute(
+            select(AgentEnvironmentVariableModel).where(AgentEnvironmentVariableModel.agent_id == created_agent.id)
+        )
+        env_var_list = list(env_vars.scalars().all())
+
+        assert len(env_var_list) == 2
+        for env_var in env_var_list:
+            # Check that value_enc is not None and is encrypted
+            assert env_var.value_enc is not None
+            assert isinstance(env_var.value_enc, str)
+
+            # Decrypt and verify
+            decrypted = Secret.from_encrypted(env_var.value_enc).get_plaintext()
+            if env_var.key == "API_KEY":
+                assert decrypted == "sk-test-secret-12345"
+            elif env_var.key == "DATABASE_URL":
+                assert decrypted == "postgres://user:pass@localhost/db"
+
+
+@pytest.mark.asyncio
+async def test_agent_environment_variables_decrypt_on_read(server: SyncServer, default_user, encryption_key):
+    """Test that reading an agent deserializes secrets correctly to AgentEnvironmentVariable objects."""
+    from letta.schemas.environment_variables import AgentEnvironmentVariable
+    from letta.schemas.secret import Secret
+
+    # Create agent with secrets
+    agent_create = CreateAgent(
+        name="test-agent-read-secrets",
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=DEFAULT_EMBEDDING_CONFIG,
+        include_base_tools=False,
+        secrets={
+            "TEST_KEY": "test-value-67890",
+        },
+    )
+
+    created_agent = await server.agent_manager.create_agent_async(agent_create, actor=default_user)
+    agent_id = created_agent.id
+
+    # Read the agent back
+    retrieved_agent = await server.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=default_user)
+
+    # Verify secrets are properly deserialized
+    assert retrieved_agent.secrets is not None
+    assert len(retrieved_agent.secrets) == 1
+
+    secret_obj = retrieved_agent.secrets[0]
+    assert isinstance(secret_obj, AgentEnvironmentVariable)
+    assert secret_obj.key == "TEST_KEY"
+    assert secret_obj.value == "test-value-67890"
+
+    # Verify value_enc is a Secret object (not a string)
+    assert secret_obj.value_enc is not None
+    assert isinstance(secret_obj.value_enc, Secret)
+
+    # Verify we can decrypt through the Secret object
+    decrypted = secret_obj.value_enc.get_plaintext()
+    assert decrypted == "test-value-67890"
+
+    # Verify get_value_secret() method works
+    value_secret = secret_obj.get_value_secret()
+    assert isinstance(value_secret, Secret)
+    assert value_secret.get_plaintext() == "test-value-67890"
+
+
+@pytest.mark.asyncio
+async def test_agent_environment_variables_update_encryption(server: SyncServer, default_user, encryption_key):
+    """Test that updating agent secrets encrypts new values."""
+    from letta.orm.sandbox_config import AgentEnvironmentVariable as AgentEnvironmentVariableModel
+    from letta.schemas.secret import Secret
+
+    # Create agent with initial secrets
+    agent_create = CreateAgent(
+        name="test-agent-update-secrets",
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=DEFAULT_EMBEDDING_CONFIG,
+        include_base_tools=False,
+        secrets={
+            "INITIAL_KEY": "initial-value",
+        },
+    )
+
+    created_agent = await server.agent_manager.create_agent_async(agent_create, actor=default_user)
+    agent_id = created_agent.id
+
+    # Update with new secrets
+    agent_update = UpdateAgent(
+        secrets={
+            "UPDATED_KEY": "updated-value-abc",
+            "NEW_KEY": "new-value-xyz",
+        },
+    )
+
+    updated_agent = await server.agent_manager.update_agent_async(agent_id=agent_id, agent_update=agent_update, actor=default_user)
+
+    # Verify updated secrets
+    assert updated_agent.secrets is not None
+    assert len(updated_agent.secrets) == 2
+
+    # Verify in database
+    async with db_registry.async_session() as session:
+        env_vars = await session.execute(select(AgentEnvironmentVariableModel).where(AgentEnvironmentVariableModel.agent_id == agent_id))
+        env_var_list = list(env_vars.scalars().all())
+
+        assert len(env_var_list) == 2
+        for env_var in env_var_list:
+            assert env_var.value_enc is not None
+
+            # Decrypt and verify
+            decrypted = Secret.from_encrypted(env_var.value_enc).get_plaintext()
+            if env_var.key == "UPDATED_KEY":
+                assert decrypted == "updated-value-abc"
+            elif env_var.key == "NEW_KEY":
+                assert decrypted == "new-value-xyz"
+            else:
+                pytest.fail(f"Unexpected key: {env_var.key}")
+
+
+@pytest.mark.asyncio
+async def test_agent_state_schema_unchanged(server: SyncServer):
+    """
+    Test that the AgentState pydantic schema structure has not changed.
+    This test validates all fields including nested pydantic objects to ensure
+    the schema remains stable across changes.
+    """
+    from letta.schemas.agent import AgentState, AgentType
+    from letta.schemas.block import Block
+    from letta.schemas.embedding_config import EmbeddingConfig
+    from letta.schemas.environment_variables import AgentEnvironmentVariable
+    from letta.schemas.group import Group
+    from letta.schemas.llm_config import LLMConfig
+    from letta.schemas.memory import Memory
+    from letta.schemas.response_format import ResponseFormatUnion
+    from letta.schemas.source import Source
+    from letta.schemas.tool import Tool
+    from letta.schemas.tool_rule import ToolRule
+
+    # Define the expected schema structure
+    expected_schema = {
+        # Core identification
+        "id": str,
+        "name": str,
+        # Tool rules
+        "tool_rules": (list, type(None)),
+        # In-context memory
+        "message_ids": (list, type(None)),
+        # System prompt
+        "system": str,
+        # Agent configuration
+        "agent_type": AgentType,
+        # LLM information
+        "llm_config": LLMConfig,
+        "embedding_config": EmbeddingConfig,
+        "response_format": (ResponseFormatUnion, type(None)),
+        # State fields
+        "description": (str, type(None)),
+        "metadata": (dict, type(None)),
+        # Memory and tools
+        "memory": Memory,  # deprecated
+        "blocks": list,
+        "tools": list,
+        "sources": list,
+        "tags": list,
+        "tool_exec_environment_variables": list,  # deprecated
+        "secrets": list,
+        # Project and template fields
+        "project_id": (str, type(None)),
+        "template_id": (str, type(None)),
+        "base_template_id": (str, type(None)),
+        "deployment_id": (str, type(None)),
+        "entity_id": (str, type(None)),
+        "identity_ids": list,
+        "identities": list,
+        # Advanced configuration
+        "message_buffer_autoclear": bool,
+        "enable_sleeptime": (bool, type(None)),
+        # Multi-agent
+        "multi_agent_group": (Group, type(None)),  # deprecated
+        "managed_group": (Group, type(None)),
+        # Run metrics
+        "last_run_completion": (datetime, type(None)),
+        "last_run_duration_ms": (int, type(None)),
+        # Timezone
+        "timezone": (str, type(None)),
+        # File controls
+        "max_files_open": (int, type(None)),
+        "per_file_view_window_char_limit": (int, type(None)),
+        # Indexing controls
+        "hidden": (bool, type(None)),
+        # Metadata fields (from OrmMetadataBase)
+        "created_by_id": (str, type(None)),
+        "last_updated_by_id": (str, type(None)),
+        "created_at": (datetime, type(None)),
+        "updated_at": (datetime, type(None)),
+    }
+
+    # Get the actual schema fields from AgentState
+    agent_state_fields = AgentState.model_fields
+    actual_field_names = set(agent_state_fields.keys())
+    expected_field_names = set(expected_schema.keys())
+
+    # Check for added fields
+    added_fields = actual_field_names - expected_field_names
+    if added_fields:
+        pytest.fail(
+            f"New fields detected in AgentState schema: {sorted(added_fields)}. "
+            "This test must be updated to include these fields, and the schema change must be intentional."
+        )
+
+    # Check for removed fields
+    removed_fields = expected_field_names - actual_field_names
+    if removed_fields:
+        pytest.fail(
+            f"Fields removed from AgentState schema: {sorted(removed_fields)}. "
+            "This test must be updated to remove these fields, and the schema change must be intentional."
+        )
+
+    # Validate field types
+    import typing
+
+    for field_name, expected_type in expected_schema.items():
+        field = agent_state_fields[field_name]
+        annotation = field.annotation
+
+        # Helper function to check if annotation matches expected type
+        def check_type_match(annotation, expected):
+            origin = typing.get_origin(annotation)
+            args = typing.get_args(annotation)
+
+            # Direct match
+            if annotation == expected:
+                return True
+
+            # Handle list type (List[X] should match list)
+            if expected is list and origin is list:
+                return True
+
+            # Handle dict type (Dict[X, Y] should match dict)
+            if expected is dict and origin is dict:
+                return True
+
+            # Handle Optional types
+            if origin is typing.Union:
+                # Check if expected type is in the union
+                if expected in args:
+                    return True
+                # Handle list case within Union (e.g., Union[List[X], None])
+                if expected is list:
+                    for arg in args:
+                        if typing.get_origin(arg) is list:
+                            return True
+                # Handle dict case within Union
+                if expected is dict:
+                    for arg in args:
+                        if typing.get_origin(arg) is dict:
+                            return True
+
+            return False
+
+        # Handle tuple of expected types (Optional)
+        if isinstance(expected_type, tuple):
+            valid = any(check_type_match(annotation, exp_t) for exp_t in expected_type)
+            if not valid:
+                pytest.fail(
+                    f"Field '{field_name}' type changed. Expected one of {expected_type}, "
+                    f"but got {annotation}. Schema changes must be intentional."
+                )
+        else:
+            # Single expected type
+            valid = check_type_match(annotation, expected_type)
+            if not valid:
+                pytest.fail(
+                    f"Field '{field_name}' type changed. Expected {expected_type}, "
+                    f"but got {annotation}. Schema changes must be intentional."
+                )
+
+    # Validate nested object schemas
+    # Memory schema
+    memory_fields = Memory.model_fields
+    expected_memory_fields = {"agent_type", "blocks", "file_blocks", "prompt_template"}
+    actual_memory_fields = set(memory_fields.keys())
+    if actual_memory_fields != expected_memory_fields:
+        pytest.fail(
+            f"Memory schema changed. Expected fields: {expected_memory_fields}, "
+            f"Got: {actual_memory_fields}. Schema changes must be intentional."
+        )
+
+    # Block schema
+    block_fields = Block.model_fields
+    expected_block_fields = {
+        "id",
+        "value",
+        "limit",
+        "project_id",
+        "template_name",
+        "is_template",
+        "template_id",
+        "base_template_id",
+        "deployment_id",
+        "entity_id",
+        "preserve_on_migration",
+        "label",
+        "read_only",
+        "description",
+        "metadata",
+        "hidden",
+        "created_by_id",
+        "last_updated_by_id",
+    }
+    actual_block_fields = set(block_fields.keys())
+    if actual_block_fields != expected_block_fields:
+        pytest.fail(
+            f"Block schema changed. Expected fields: {expected_block_fields}, "
+            f"Got: {actual_block_fields}. Schema changes must be intentional."
+        )
+
+    # Tool schema
+    tool_fields = Tool.model_fields
+    expected_tool_fields = {
+        "id",
+        "tool_type",
+        "description",
+        "source_type",
+        "name",
+        "tags",
+        "source_code",
+        "json_schema",
+        "args_json_schema",
+        "return_char_limit",
+        "pip_requirements",
+        "npm_requirements",
+        "default_requires_approval",
+        "enable_parallel_execution",
+        "created_by_id",
+        "last_updated_by_id",
+        "metadata_",
+    }
+    actual_tool_fields = set(tool_fields.keys())
+    if actual_tool_fields != expected_tool_fields:
+        pytest.fail(
+            f"Tool schema changed. Expected fields: {expected_tool_fields}, Got: {actual_tool_fields}. Schema changes must be intentional."
+        )
+
+    # Source schema
+    source_fields = Source.model_fields
+    expected_source_fields = {
+        "id",
+        "name",
+        "description",
+        "instructions",
+        "metadata",
+        "embedding_config",
+        "organization_id",
+        "vector_db_provider",
+        "created_by_id",
+        "last_updated_by_id",
+        "created_at",
+        "updated_at",
+    }
+    actual_source_fields = set(source_fields.keys())
+    if actual_source_fields != expected_source_fields:
+        pytest.fail(
+            f"Source schema changed. Expected fields: {expected_source_fields}, "
+            f"Got: {actual_source_fields}. Schema changes must be intentional."
+        )
+
+    # LLMConfig schema
+    llm_config_fields = LLMConfig.model_fields
+    expected_llm_config_fields = {
+        "model",
+        "display_name",
+        "model_endpoint_type",
+        "model_endpoint",
+        "provider_name",
+        "provider_category",
+        "model_wrapper",
+        "context_window",
+        "put_inner_thoughts_in_kwargs",
+        "handle",
+        "temperature",
+        "max_tokens",
+        "enable_reasoner",
+        "reasoning_effort",
+        "max_reasoning_tokens",
+        "frequency_penalty",
+        "compatibility_type",
+        "verbosity",
+        "tier",
+        "parallel_tool_calls",
+    }
+    actual_llm_config_fields = set(llm_config_fields.keys())
+    if actual_llm_config_fields != expected_llm_config_fields:
+        pytest.fail(
+            f"LLMConfig schema changed. Expected fields: {expected_llm_config_fields}, "
+            f"Got: {actual_llm_config_fields}. Schema changes must be intentional."
+        )
+
+    # EmbeddingConfig schema
+    embedding_config_fields = EmbeddingConfig.model_fields
+    expected_embedding_config_fields = {
+        "embedding_endpoint_type",
+        "embedding_endpoint",
+        "embedding_model",
+        "embedding_dim",
+        "embedding_chunk_size",
+        "handle",
+        "batch_size",
+        "azure_endpoint",
+        "azure_version",
+        "azure_deployment",
+    }
+    actual_embedding_config_fields = set(embedding_config_fields.keys())
+    if actual_embedding_config_fields != expected_embedding_config_fields:
+        pytest.fail(
+            f"EmbeddingConfig schema changed. Expected fields: {expected_embedding_config_fields}, "
+            f"Got: {actual_embedding_config_fields}. Schema changes must be intentional."
+        )
+
+    # AgentEnvironmentVariable schema
+    agent_env_var_fields = AgentEnvironmentVariable.model_fields
+    expected_agent_env_var_fields = {
+        "id",
+        "key",
+        "value",
+        "description",
+        "organization_id",
+        "value_enc",
+        "agent_id",
+        # From OrmMetadataBase
+        "created_by_id",
+        "last_updated_by_id",
+        "created_at",
+        "updated_at",
+    }
+    actual_agent_env_var_fields = set(agent_env_var_fields.keys())
+    if actual_agent_env_var_fields != expected_agent_env_var_fields:
+        pytest.fail(
+            f"AgentEnvironmentVariable schema changed. Expected fields: {expected_agent_env_var_fields}, "
+            f"Got: {actual_agent_env_var_fields}. Schema changes must be intentional."
+        )
+
+    # Group schema
+    group_fields = Group.model_fields
+    expected_group_fields = {
+        "id",
+        "manager_type",
+        "agent_ids",
+        "description",
+        "project_id",
+        "template_id",
+        "base_template_id",
+        "deployment_id",
+        "shared_block_ids",
+        "manager_agent_id",
+        "termination_token",
+        "max_turns",
+        "sleeptime_agent_frequency",
+        "turns_counter",
+        "last_processed_message_id",
+        "max_message_buffer_length",
+        "min_message_buffer_length",
+        "hidden",
+    }
+    actual_group_fields = set(group_fields.keys())
+    if actual_group_fields != expected_group_fields:
+        pytest.fail(
+            f"Group schema changed. Expected fields: {expected_group_fields}, "
+            f"Got: {actual_group_fields}. Schema changes must be intentional."
+        )
+
+
+async def test_agent_state_relationship_loads(server: SyncServer, default_user, print_tool, default_block):
+    memory_blocks = [CreateBlock(label="human", value="TestUser"), CreateBlock(label="persona", value="I am a test assistant")]
+
+    create_agent_request = CreateAgent(
+        name="test_default_source_agent",
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tool_ids=[print_tool.id],
+        include_default_source=True,
+        include_base_tools=False,
+        tags=["test_tag"],
+    )
+
+    # Create the agent
+    created_agent = await server.agent_manager.create_agent_async(
+        create_agent_request,
+        actor=default_user,
+    )
+
+    # Test legacy default include_relationships
+    agent_state = await server.agent_manager.get_agent_by_id_async(
+        agent_id=created_agent.id,
+        actor=default_user,
+    )
+    assert agent_state.blocks
+    assert agent_state.sources
+    assert agent_state.tags
+    assert agent_state.tools
+
+    # Test include_relationships override
+    agent_state = await server.agent_manager.get_agent_by_id_async(
+        agent_id=created_agent.id,
+        actor=default_user,
+        include_relationships=[],
+    )
+    assert not agent_state.blocks
+    assert not agent_state.sources
+    assert not agent_state.tags
+    assert not agent_state.tools
+
+    # Test include_relationships override with specific relationships
+    agent_state = await server.agent_manager.get_agent_by_id_async(
+        agent_id=created_agent.id,
+        actor=default_user,
+        include_relationships=["memory", "sources"],
+    )
+    assert agent_state.blocks
+    assert agent_state.sources
+    assert not agent_state.tags
+    assert not agent_state.tools
+
+    # Test include override with specific relationships
+    agent_state = await server.agent_manager.get_agent_by_id_async(
+        agent_id=created_agent.id,
+        actor=default_user,
+        include_relationships=[],
+        include=["agent.blocks", "agent.sources"],
+    )
+    assert agent_state.blocks
+    assert agent_state.sources
+    assert not agent_state.tags
+    assert not agent_state.tools
