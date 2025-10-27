@@ -43,6 +43,7 @@ from letta.schemas.letta_message import (
 )
 from letta.schemas.letta_message_content import (
     OmittedReasoningContent,
+    ReasoningContent,
     SummarizedReasoningContent,
     SummarizedReasoningContentPart,
     TextContent,
@@ -51,6 +52,7 @@ from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import FunctionCall, ToolCall
 from letta.server.rest_api.json_parser import OptimisticJSONParser
+from letta.server.rest_api.utils import decrement_message_uuid
 from letta.streaming_utils import (
     FunctionArgumentsStreamHandler,
     JSONInnerThoughtsExtractor,
@@ -203,7 +205,7 @@ class OpenAIStreamingInterface:
         except Exception as e:
             import traceback
 
-            logger.error("Error processing stream: %s\n%s", e, traceback.format_exc())
+            logger.exception("Error processing stream: %s", e)
             if ttft_span:
                 ttft_span.add_event(
                     name="stop_reason",
@@ -324,14 +326,14 @@ class OpenAIStreamingInterface:
                                 self.tool_call_name = str(self.function_name_buffer)
                                 if self.tool_call_name in self.requires_approval_tools:
                                     tool_call_msg = ApprovalRequestMessage(
-                                        id=self.letta_message_id,
+                                        id=decrement_message_uuid(self.letta_message_id),
                                         date=datetime.now(timezone.utc),
                                         tool_call=ToolCallDelta(
                                             name=self.function_name_buffer,
                                             arguments=None,
                                             tool_call_id=self.function_id_buffer,
                                         ),
-                                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                                        otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                                         run_id=self.run_id,
                                         step_id=self.step_id,
                                     )
@@ -412,7 +414,7 @@ class OpenAIStreamingInterface:
                                         message_index += 1
                                     if self.function_name_buffer in self.requires_approval_tools:
                                         tool_call_msg = ApprovalRequestMessage(
-                                            id=self.letta_message_id,
+                                            id=decrement_message_uuid(self.letta_message_id),
                                             date=datetime.now(timezone.utc),
                                             tool_call=ToolCallDelta(
                                                 name=self.function_name_buffer,
@@ -420,7 +422,7 @@ class OpenAIStreamingInterface:
                                                 tool_call_id=self.function_id_buffer,
                                             ),
                                             # name=name,
-                                            otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                                            otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                                             run_id=self.run_id,
                                             step_id=self.step_id,
                                         )
@@ -451,7 +453,7 @@ class OpenAIStreamingInterface:
                                         message_index += 1
                                     if self.function_name_buffer in self.requires_approval_tools:
                                         tool_call_msg = ApprovalRequestMessage(
-                                            id=self.letta_message_id,
+                                            id=decrement_message_uuid(self.letta_message_id),
                                             date=datetime.now(timezone.utc),
                                             tool_call=ToolCallDelta(
                                                 name=None,
@@ -459,7 +461,7 @@ class OpenAIStreamingInterface:
                                                 tool_call_id=self.function_id_buffer,
                                             ),
                                             # name=name,
-                                            otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                                            otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                                             run_id=self.run_id,
                                             step_id=self.step_id,
                                         )
@@ -532,20 +534,31 @@ class SimpleOpenAIStreamingInterface:
 
         self.requires_approval_tools = requires_approval_tools
 
-    def get_content(self) -> list[TextContent | OmittedReasoningContent]:
+    def get_content(self) -> list[TextContent | OmittedReasoningContent | ReasoningContent]:
         shown_omitted = False
         concat_content = ""
         merged_messages = []
+        reasoning_content = []
+
         for msg in self.content_messages:
             if isinstance(msg, HiddenReasoningMessage) and not shown_omitted:
                 merged_messages.append(OmittedReasoningContent())
                 shown_omitted = True
+            elif isinstance(msg, ReasoningMessage):
+                reasoning_content.append(msg.reasoning)
             elif isinstance(msg, AssistantMessage):
                 if isinstance(msg.content, list):
                     concat_content += "".join([c.text for c in msg.content])
                 else:
                     concat_content += msg.content
-        merged_messages.append(TextContent(text=concat_content))
+
+        if reasoning_content:
+            combined_reasoning = "".join(reasoning_content)
+            merged_messages.append(ReasoningContent(is_native=True, reasoning=combined_reasoning, signature=None))
+
+        if concat_content:
+            merged_messages.append(TextContent(text=concat_content))
+
         return merged_messages
 
     def get_tool_call_object(self) -> ToolCall:
@@ -591,6 +604,8 @@ class SimpleOpenAIStreamingInterface:
                 # For reasoning models, emit a hidden reasoning message before the first chunk
                 if not self.emitted_hidden_reasoning and is_openai_reasoning_model(self.model):
                     self.emitted_hidden_reasoning = True
+                    if prev_message_type and prev_message_type != "hidden_reasoning_message":
+                        message_index += 1
                     hidden_message = HiddenReasoningMessage(
                         id=self.letta_message_id,
                         date=datetime.now(timezone.utc),
@@ -602,7 +617,6 @@ class SimpleOpenAIStreamingInterface:
                     )
                     self.content_messages.append(hidden_message)
                     prev_message_type = hidden_message.message_type
-                    message_index += 1  # Increment for the next message
                     yield hidden_message
 
                 async for chunk in stream:
@@ -632,7 +646,7 @@ class SimpleOpenAIStreamingInterface:
         except Exception as e:
             import traceback
 
-            logger.error("Error processing stream: %s\n%s", e, traceback.format_exc())
+            logger.exception("Error processing stream: %s", e)
             if ttft_span:
                 ttft_span.add_event(
                     name="stop_reason",
@@ -664,9 +678,11 @@ class SimpleOpenAIStreamingInterface:
             message_delta = choice.delta
 
             if message_delta.content is not None and message_delta.content != "":
+                if prev_message_type and prev_message_type != "assistant_message":
+                    message_index += 1
                 assistant_msg = AssistantMessage(
                     id=self.letta_message_id,
-                    content=[TextContent(text=message_delta.content)],
+                    content=message_delta.content,
                     date=datetime.now(timezone.utc).isoformat(),
                     otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
                     run_id=self.run_id,
@@ -674,8 +690,32 @@ class SimpleOpenAIStreamingInterface:
                 )
                 self.content_messages.append(assistant_msg)
                 prev_message_type = assistant_msg.message_type
-                message_index += 1  # Increment for the next message
                 yield assistant_msg
+
+            if (
+                hasattr(chunk, "choices")
+                and len(chunk.choices) > 0
+                and hasattr(chunk.choices[0], "delta")
+                and hasattr(chunk.choices[0].delta, "reasoning_content")
+            ):
+                delta = chunk.choices[0].delta
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if reasoning_content is not None and reasoning_content != "":
+                    if prev_message_type and prev_message_type != "reasoning_message":
+                        message_index += 1
+                    reasoning_msg = ReasoningMessage(
+                        id=self.letta_message_id,
+                        date=datetime.now(timezone.utc).isoformat(),
+                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        source="reasoner_model",
+                        reasoning=reasoning_content,
+                        signature=None,
+                        run_id=self.run_id,
+                        step_id=self.step_id,
+                    )
+                    self.content_messages.append(reasoning_msg)
+                    prev_message_type = reasoning_msg.message_type
+                    yield reasoning_msg
 
             if message_delta.tool_calls is not None and len(message_delta.tool_calls) > 0:
                 tool_call = message_delta.tool_calls[0]
@@ -710,7 +750,7 @@ class SimpleOpenAIStreamingInterface:
 
                 if self.requires_approval_tools:
                     tool_call_msg = ApprovalRequestMessage(
-                        id=self.letta_message_id,
+                        id=decrement_message_uuid(self.letta_message_id),
                         date=datetime.now(timezone.utc),
                         tool_call=ToolCallDelta(
                             name=tool_call.function.name,
@@ -718,11 +758,13 @@ class SimpleOpenAIStreamingInterface:
                             tool_call_id=tool_call.id,
                         ),
                         # name=name,
-                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
                 else:
+                    if prev_message_type and prev_message_type != "tool_call_message":
+                        message_index += 1
                     tool_call_delta = ToolCallDelta(
                         name=tool_call.function.name,
                         arguments=tool_call.function.arguments,
@@ -738,8 +780,7 @@ class SimpleOpenAIStreamingInterface:
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
-                prev_message_type = tool_call_msg.message_type
-                message_index += 1  # Increment for the next message
+                    prev_message_type = tool_call_msg.message_type
                 yield tool_call_msg
 
 
@@ -873,7 +914,7 @@ class SimpleOpenAIResponsesStreamingInterface:
         except Exception as e:
             import traceback
 
-            logger.error("Error processing stream: %s\n%s", e, traceback.format_exc())
+            logger.exception("Error processing stream: %s", e)
             if ttft_span:
                 ttft_span.add_event(
                     name="stop_reason",
@@ -935,11 +976,9 @@ class SimpleOpenAIResponsesStreamingInterface:
                 # cache for approval if/elses
                 self.tool_call_name = name
                 if self.tool_call_name and self.tool_call_name in self.requires_approval_tools:
-                    if prev_message_type and prev_message_type != "approval_request_message":
-                        message_index += 1
                     yield ApprovalRequestMessage(
-                        id=self.letta_message_id,
-                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        id=decrement_message_uuid(self.letta_message_id),
+                        otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         date=datetime.now(timezone.utc),
                         tool_call=ToolCallDelta(
                             name=name,
@@ -949,7 +988,6 @@ class SimpleOpenAIResponsesStreamingInterface:
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
-                    prev_message_type = "tool_call_message"
                 else:
                     if prev_message_type and prev_message_type != "tool_call_message":
                         message_index += 1
@@ -1105,11 +1143,9 @@ class SimpleOpenAIResponsesStreamingInterface:
             delta = event.delta
 
             if self.tool_call_name and self.tool_call_name in self.requires_approval_tools:
-                if prev_message_type and prev_message_type != "approval_request_message":
-                    message_index += 1
                 yield ApprovalRequestMessage(
-                    id=self.letta_message_id,
-                    otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                    id=decrement_message_uuid(self.letta_message_id),
+                    otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                     date=datetime.now(timezone.utc),
                     tool_call=ToolCallDelta(
                         name=None,
@@ -1119,7 +1155,6 @@ class SimpleOpenAIResponsesStreamingInterface:
                     run_id=self.run_id,
                     step_id=self.step_id,
                 )
-                prev_message_type = "approval_request_message"
             else:
                 if prev_message_type and prev_message_type != "tool_call_message":
                     message_index += 1

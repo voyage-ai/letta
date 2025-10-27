@@ -9,6 +9,7 @@ from starlette import status
 from starlette.responses import Response
 
 import letta.constants as constants
+from letta.errors import LettaInvalidArgumentError, LettaUnsupportedFileUploadError
 from letta.helpers.pinecone_utils import (
     delete_file_records_from_pinecone_index,
     delete_source_records_from_pinecone_index,
@@ -20,9 +21,9 @@ from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import DuplicateFileHandling, FileProcessingStatus
-from letta.schemas.file import FileMetadata
+from letta.schemas.file import FileMetadata, FileMetadataBase
 from letta.schemas.passage import Passage
-from letta.schemas.source import Source, SourceCreate, SourceUpdate
+from letta.schemas.source import BaseSource, Source, SourceCreate, SourceUpdate
 from letta.schemas.source_metadata import OrganizationSourcesStats
 from letta.schemas.user import User
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
@@ -35,6 +36,7 @@ from letta.services.file_processor.parser.markitdown_parser import MarkitdownFil
 from letta.services.file_processor.parser.mistral_parser import MistralFileParser
 from letta.settings import settings
 from letta.utils import safe_create_file_processing_task, safe_create_task, sanitize_filename
+from letta.validators import FileId, SourceId
 
 logger = get_logger(__name__)
 
@@ -58,7 +60,7 @@ async def count_sources(
 
 @router.get("/{source_id}", response_model=Source, operation_id="retrieve_source", deprecated=True)
 async def retrieve_source(
-    source_id: str,
+    source_id: SourceId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -66,10 +68,7 @@ async def retrieve_source(
     Get all sources
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-
     source = await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
-    if not source:
-        raise HTTPException(status_code=404, detail=f"Source with id={source_id} not found.")
     return source
 
 
@@ -85,8 +84,6 @@ async def get_source_id_by_name(
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
 
     source = await server.source_manager.get_source_by_name(source_name=source_name, actor=actor)
-    if not source:
-        raise HTTPException(status_code=404, detail=f"Source with name={source_name} not found.")
     return source.id
 
 
@@ -138,8 +135,9 @@ async def create_source(
     if not source_create.embedding_config:
         if not source_create.embedding:
             if settings.default_embedding_handle is None:
-                # TODO: modify error type
-                raise ValueError("Must specify either embedding or embedding_config in request")
+                raise LettaInvalidArgumentError(
+                    "Must specify either embedding or embedding_config in request", argument_name="default_embedding_handle"
+                )
             else:
                 source_create.embedding = settings.default_embedding_handle
         source_create.embedding_config = await server.get_embedding_config_from_handle_async(
@@ -159,8 +157,8 @@ async def create_source(
 
 @router.patch("/{source_id}", response_model=Source, operation_id="modify_source", deprecated=True)
 async def modify_source(
-    source_id: str,
     source: SourceUpdate,
+    source_id: SourceId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -169,14 +167,13 @@ async def modify_source(
     """
     # TODO: allow updating the handle/embedding config
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    if not await server.source_manager.get_source_by_id(source_id=source_id, actor=actor):
-        raise HTTPException(status_code=404, detail=f"Source with id={source_id} does not exist.")
+    await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
     return await server.source_manager.update_source(source_id=source_id, source_update=source, actor=actor)
 
 
 @router.delete("/{source_id}", response_model=None, operation_id="delete_source", deprecated=True)
 async def delete_source(
-    source_id: str,
+    source_id: SourceId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -203,18 +200,16 @@ async def delete_source(
         await server.remove_files_from_context_window(agent_state=agent_state, file_ids=file_ids, actor=actor)
 
         if agent_state.enable_sleeptime:
-            try:
-                block = await server.agent_manager.get_block_with_label_async(agent_id=agent_state.id, block_label=source.name, actor=actor)
+            block = await server.agent_manager.get_block_with_label_async(agent_id=agent_state.id, block_label=source.name, actor=actor)
+            if block:
                 await server.block_manager.delete_block_async(block.id, actor)
-            except:
-                pass
     await server.delete_source(source_id=source_id, actor=actor)
 
 
 @router.post("/{source_id}/upload", response_model=FileMetadata, operation_id="upload_file_to_source", deprecated=True)
 async def upload_file_to_source(
     file: UploadFile,
-    source_id: str,
+    source_id: SourceId,
     duplicate_handling: DuplicateFileHandling = Query(DuplicateFileHandling.SUFFIX, description="How to handle duplicate filenames"),
     name: Optional[str] = Query(None, description="Optional custom name to override the uploaded file's name"),
     server: "SyncServer" = Depends(get_letta_server),
@@ -246,9 +241,8 @@ async def upload_file_to_source(
 
     # If still not allowed, reject with 415.
     if media_type not in allowed_media_types:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=(
+        raise LettaUnsupportedFileUploadError(
+            message=(
                 f"Unsupported file type: {media_type or 'unknown'} "
                 f"(filename: {file.filename}). "
                 f"Supported types: PDF, text files (.txt, .md), JSON, and code files (.py, .js, .java, etc.)."
@@ -258,8 +252,6 @@ async def upload_file_to_source(
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
 
     source = await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
-    if source is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Source with id={source_id} not found.")
 
     content = await file.read()
 
@@ -278,8 +270,9 @@ async def upload_file_to_source(
     if existing_file:
         # Duplicate found, handle based on strategy
         if duplicate_handling == DuplicateFileHandling.ERROR:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=f"File '{original_filename}' already exists in source '{source.name}'"
+            raise LettaInvalidArgumentError(
+                message=f"File '{original_filename}' already exists in source '{source.name}'",
+                argument_name="duplicate_handling",
             )
         elif duplicate_handling == DuplicateFileHandling.SKIP:
             # Return existing file metadata with custom header to indicate it was skipped
@@ -331,7 +324,7 @@ async def upload_file_to_source(
 
 @router.get("/{source_id}/agents", response_model=List[str], operation_id="get_agents_for_source", deprecated=True)
 async def get_agents_for_source(
-    source_id: str,
+    source_id: SourceId,
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -344,7 +337,7 @@ async def get_agents_for_source(
 
 @router.get("/{source_id}/passages", response_model=List[Passage], operation_id="list_source_passages", deprecated=True)
 async def list_source_passages(
-    source_id: str,
+    source_id: SourceId,
     after: Optional[str] = Query(None, description="Message after which to retrieve the returned messages."),
     before: Optional[str] = Query(None, description="Message before which to retrieve the returned messages."),
     limit: int = Query(100, description="Maximum number of messages to retrieve."),
@@ -366,7 +359,7 @@ async def list_source_passages(
 
 @router.get("/{source_id}/files", response_model=List[FileMetadata], operation_id="list_source_files", deprecated=True)
 async def list_source_files(
-    source_id: str,
+    source_id: SourceId,
     limit: int = Query(1000, description="Number of files to return"),
     after: Optional[str] = Query(None, description="Pagination cursor to fetch the next set of results"),
     include_content: bool = Query(False, description="Whether to include full file content"),
@@ -394,8 +387,8 @@ async def list_source_files(
 
 @router.get("/{source_id}/files/{file_id}", response_model=FileMetadata, operation_id="get_file_metadata", deprecated=True)
 async def get_file_metadata(
-    source_id: str,
-    file_id: str,
+    source_id: SourceId,
+    file_id: FileId,
     include_content: bool = Query(False, description="Whether to include full file content"),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -410,13 +403,6 @@ async def get_file_metadata(
         file_id=file_id, actor=actor, include_content=include_content, strip_directory_prefix=True
     )
 
-    if not file_metadata:
-        raise HTTPException(status_code=404, detail=f"File with id={file_id} not found.")
-
-    # Verify the file belongs to the specified source
-    if file_metadata.source_id != source_id:
-        raise HTTPException(status_code=404, detail=f"File with id={file_id} not found in source {source_id}.")
-
     # Check and update file status (timeout check and pinecone embedding sync)
     file_metadata = await server.file_manager.check_and_update_file_status(file_metadata, actor)
 
@@ -427,8 +413,8 @@ async def get_file_metadata(
 # it's still good practice to return a status indicating the success or failure of the deletion
 @router.delete("/{source_id}/{file_id}", status_code=204, operation_id="delete_file_from_source", deprecated=True)
 async def delete_file_from_source(
-    source_id: str,
-    file_id: str,
+    source_id: SourceId,
+    file_id: FileId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -452,8 +438,6 @@ async def delete_file_from_source(
         await delete_file_records_from_pinecone_index(file_id=file_id, actor=actor)
 
     safe_create_task(sleeptime_document_ingest_async(server, source_id, actor, clear_history=True), label="document_ingest_after_delete")
-    if deleted_file is None:
-        raise HTTPException(status_code=404, detail=f"File with id={file_id} not found.")
 
 
 async def load_file_to_source_async(server: SyncServer, source_id: str, job_id: str, filename: str, bytes: bytes, actor: User):

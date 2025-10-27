@@ -30,14 +30,17 @@ from letta.schemas.letta_message_content import TextContent
 from letta.schemas.mcp import UpdateSSEMCPServer, UpdateStdioMCPServer, UpdateStreamableHTTPMCPServer
 from letta.schemas.message import Message
 from letta.schemas.pip_requirement import PipRequirement
-from letta.schemas.tool import Tool, ToolCreate, ToolRunFromSource, ToolUpdate
+from letta.schemas.tool import BaseTool, Tool, ToolCreate, ToolRunFromSource, ToolUpdate
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.server.rest_api.streaming_response import StreamingResponseWithStatusCode
 from letta.server.server import SyncServer
 from letta.services.mcp.oauth_utils import MCPOAuthSession, drill_down_exception, oauth_stream_event
 from letta.services.mcp.stdio_client import AsyncStdioMCPClient
 from letta.services.mcp.types import OauthStreamEvent
+from letta.services.summarizer.summarizer import traceback
 from letta.settings import tool_settings
+from letta.utils import asyncio
+from letta.validators import ToolId
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -46,7 +49,7 @@ logger = get_logger(__name__)
 
 @router.delete("/{tool_id}", operation_id="delete_tool")
 async def delete_tool(
-    tool_id: str,
+    tool_id: ToolId,
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -149,7 +152,7 @@ async def count_tools(
 
 @router.get("/{tool_id}", response_model=Tool, operation_id="retrieve_tool")
 async def retrieve_tool(
-    tool_id: str,
+    tool_id: ToolId,
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -297,7 +300,7 @@ async def upsert_tool(
 
 @router.patch("/{tool_id}", response_model=Tool, operation_id="modify_tool")
 async def modify_tool(
-    tool_id: str,
+    tool_id: ToolId,
     request: ToolUpdate = Body(...),
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -443,14 +446,11 @@ async def add_mcp_tool(
                 argument_name="mcp_tool_name",
             )
 
-        # Check tool health - reject only INVALID tools
-        if mcp_tool.health:
-            if mcp_tool.health.status == "INVALID":
-                raise LettaInvalidMCPSchemaError(
-                    server_name=mcp_server_name,
-                    mcp_tool_name=mcp_tool_name,
-                    reasons=mcp_tool.health.reasons,
-                )
+        # Log warning if tool has invalid schema but allow attachment
+        if mcp_tool.health and mcp_tool.health.status == "INVALID":
+            logger.warning(
+                f"Attaching MCP tool {mcp_tool_name} from server {mcp_server_name} with invalid schema. Reasons: {mcp_tool.health.reasons}"
+            )
 
         tool_create = ToolCreate.from_mcp(mcp_server_name=mcp_server_name, mcp_tool=mcp_tool)
         # For config-based servers, use the server name as ID since they don't have database IDs
@@ -666,7 +666,11 @@ async def connect_mcp_server(
             detailed_error = drill_down_exception(e)
             logger.error(f"Error in OAuth stream:\n{detailed_error}")
             yield oauth_stream_event(OauthStreamEvent.ERROR, message=f"Internal error: {detailed_error}")
-
+        # TODO: investigate cancelled by cancel scope errors here during oauth exchange flow
+        except asyncio.CancelledError as e:
+            logger.error(f"CancelledError: {e!r}")
+            tb = "".join(traceback.format_stack())
+            logger.error(f"Stack trace at cancellation:\n{tb}")
         finally:
             if client:
                 try:

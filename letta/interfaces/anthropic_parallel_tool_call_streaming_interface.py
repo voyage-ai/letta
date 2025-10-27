@@ -39,6 +39,7 @@ from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import FunctionCall, ToolCall
 from letta.server.rest_api.json_parser import JSONParser, PydanticJSONParser
+from letta.server.rest_api.utils import decrement_message_uuid
 
 logger = get_logger(__name__)
 
@@ -282,14 +283,12 @@ class SimpleAnthropicStreamingInterface:
                 call_id = content.id
                 # Initialize arguments from the start event's input (often {}) to avoid undefined in UIs
                 if name in self.requires_approval_tools:
-                    if prev_message_type and prev_message_type != "approval_request_message":
-                        message_index += 1
                     tool_call_msg = ApprovalRequestMessage(
-                        id=self.letta_message_id,
+                        id=decrement_message_uuid(self.letta_message_id),
                         # Do not emit placeholder arguments here to avoid UI duplicates
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id),
                         date=datetime.now(timezone.utc).isoformat(),
-                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
@@ -300,12 +299,13 @@ class SimpleAnthropicStreamingInterface:
                         id=self.letta_message_id,
                         # Do not emit placeholder arguments here to avoid UI duplicates
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id),
+                        tool_calls=ToolCallDelta(name=name, tool_call_id=call_id),
                         date=datetime.now(timezone.utc).isoformat(),
                         otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
-                prev_message_type = tool_call_msg.message_type
+                    prev_message_type = tool_call_msg.message_type
                 yield tool_call_msg
 
             elif isinstance(content, BetaThinkingBlock):
@@ -345,7 +345,6 @@ class SimpleAnthropicStreamingInterface:
 
                 assistant_msg = AssistantMessage(
                     id=self.letta_message_id,
-                    # content=[TextContent(text=delta.text)],
                     content=delta.text,
                     date=datetime.now(timezone.utc).isoformat(),
                     otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
@@ -381,13 +380,11 @@ class SimpleAnthropicStreamingInterface:
                 call_id = ctx.get("id")
 
                 if name in self.requires_approval_tools:
-                    if prev_message_type and prev_message_type != "approval_request_message":
-                        message_index += 1
                     tool_call_msg = ApprovalRequestMessage(
-                        id=self.letta_message_id,
+                        id=decrement_message_uuid(self.letta_message_id),
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id, arguments=delta.partial_json),
                         date=datetime.now(timezone.utc).isoformat(),
-                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
@@ -397,12 +394,13 @@ class SimpleAnthropicStreamingInterface:
                     tool_call_msg = ToolCallMessage(
                         id=self.letta_message_id,
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id, arguments=delta.partial_json),
+                        tool_calls=ToolCallDelta(name=name, tool_call_id=call_id, arguments=delta.partial_json),
                         date=datetime.now(timezone.utc).isoformat(),
                         otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
                         run_id=self.run_id,
                         step_id=self.step_id,
                     )
-
+                    prev_message_type = tool_call_msg.message_type
                 yield tool_call_msg
 
             elif isinstance(delta, BetaThinkingDelta):

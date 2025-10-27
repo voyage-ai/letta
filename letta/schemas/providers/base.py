@@ -1,10 +1,14 @@
 from datetime import datetime
 
+from letta.log import get_logger
+
+logger = get_logger(__name__)
+
 from pydantic import BaseModel, Field, model_validator
 
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.embedding_config_overrides import EMBEDDING_HANDLE_OVERRIDES
-from letta.schemas.enums import ProviderCategory, ProviderType
+from letta.schemas.enums import PrimitiveType, ProviderCategory, ProviderType
 from letta.schemas.letta_base import LettaBase
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.llm_config_overrides import LLM_HANDLE_OVERRIDES
@@ -13,7 +17,7 @@ from letta.settings import model_settings
 
 
 class ProviderBase(LettaBase):
-    __id_prefix__ = "provider"
+    __id_prefix__ = PrimitiveType.PROVIDER.value
 
 
 class Provider(ProviderBase):
@@ -90,7 +94,7 @@ class Provider(ProviderBase):
         import asyncio
         import warnings
 
-        warnings.warn("list_llm_models is deprecated, use list_llm_models_async instead", DeprecationWarning, stacklevel=2)
+        logger.warning("list_llm_models is deprecated, use list_llm_models_async instead", stacklevel=2)
 
         # Simplified asyncio handling - just use asyncio.run()
         # This works in most contexts and avoids complex event loop detection
@@ -115,7 +119,7 @@ class Provider(ProviderBase):
         import asyncio
         import warnings
 
-        warnings.warn("list_embedding_models is deprecated, use list_embedding_models_async instead", DeprecationWarning, stacklevel=2)
+        logger.warning("list_embedding_models is deprecated, use list_embedding_models_async instead", stacklevel=2)
 
         # Simplified asyncio handling - just use asyncio.run()
         # This works in most contexts and avoids complex event loop detection

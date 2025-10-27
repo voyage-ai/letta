@@ -50,8 +50,9 @@ tabs:
   leaderboard:
     display-name: Leaderboard
     skip-slug: true
-
-
+  evals:
+    display-name: Evals
+    slug: evals
 landing-page:
   page: home
   path: pages/index.mdx
@@ -99,25 +100,10 @@ navigation:
         contents:
           - page: Overview
             path: pages/agents/overview.mdx
-          - section: Agent Architectures
-            path: pages/agents/architectures.mdx
-            contents:
-              - page: MemGPT Agents
-                path: pages/agents/memgpt_agents.mdx
-              - page: Low-latency (voice) Agents
-                path: pages/agents/low_latency_agents.mdx
-              - page: ReAct Agents
-                path: pages/agents/react_agents.mdx
-              - page: Workflows
-                path: pages/agents/workflows.mdx
-              - page: Stateful Workflows
-                path: pages/agents/stateful_workflows.mdx
           - page: Context Hierarchy
             path: pages/agents/context_hierarchy.mdx
           - page: Message Types
             path: pages/agents/message_types.mdx
-          - page: Heartbeats
-            path: pages/agents/heartbeats.mdx
 
       - section: Memory
         path: pages/agents/memory.mdx
@@ -151,8 +137,17 @@ navigation:
         contents:
           - page: Overview
             path: pages/agents/tools.mdx
-          - page: Pre-built Tools
+          - page: Base Tools
+            path: pages/agents/base_tools.mdx
+          - section: Utilities
             path: pages/agents/prebuilt_tools.mdx
+            contents:
+              - page: Web Search
+                path: pages/agents/web_search.mdx
+              - page: Code Interpreter
+                path: pages/agents/run_code.mdx
+              - page: Fetch Webpage
+                path: pages/agents/fetch_webpage.mdx
           - page: Custom Tools
             path: pages/agents/custom_tools.mdx
           - page: Tool Rules
@@ -213,6 +208,25 @@ navigation:
             path: pages/concepts/letta.mdx
           - page: MemGPT Paper Deep Dive
             path: pages/concepts/memgpt.mdx
+
+      - section: Legacy & Migration
+        contents:
+          - page: Legacy Architecture Overview
+            path: pages/legacy/architectures_overview.mdx
+          - page: Migration Guide
+            path: pages/legacy/migration_guide.mdx
+          - page: MemGPT Agents (Legacy)
+            path: pages/legacy/memgpt_agents_legacy.mdx
+          - page: Workflows (Legacy)
+            path: pages/legacy/workflows_legacy.mdx
+          - page: Low-latency Agents (Legacy)
+            path: pages/legacy/low_latency_agents_legacy.mdx
+          - page: ReAct Agents (Legacy)
+            path: pages/legacy/react_agents_legacy.mdx
+          - page: Heartbeats (Legacy)
+            path: pages/legacy/heartbeats_legacy.mdx
+          - page: Architecture Naming History
+            path: pages/legacy/naming_history.mdx
 
       #- section: Tool Execution
       #  contents:
@@ -504,10 +518,76 @@ navigation:
               - POST /v1/agents/
               - PATCH /v1/agents/{agent_id}
               - DELETE /v1/agents/{agent_id}
-              - GET /v1/agents/count
+              - endpoint: GET /v1/agents/count
+                hidden: true
               - POST /v1/agents/import
               - GET /v1/agents/{agent_id}/export
-              - POST /v1/agents/search
+              - endpoint: POST /v1/agents/search
+                hidden: true
+              - section: Blocks
+                contents:
+                  - GET /v1/agents/{agent_id}/core-memory/blocks
+                  - GET /v1/agents/{agent_id}/core-memory/blocks/{block_label}
+                  - PATCH /v1/agents/{agent_id}/core-memory/blocks/{block_label}
+                  - PATCH /v1/agents/{agent_id}/core-memory/blocks/attach/{block_id}
+                  - PATCH /v1/agents/{agent_id}/core-memory/blocks/detach/{block_id}
+              - section: Tools
+                contents:
+                  - GET /v1/agents/{agent_id}/tools
+                  - PATCH /v1/agents/{agent_id}/tools/attach/{tool_id}
+                  - PATCH /v1/agents/{agent_id}/tools/detach/{tool_id}
+                  - PATCH /v1/agents/{agent_id}/tools/approval/{tool_name}
+              - section: Messages
+                contents:
+                  - GET /v1/agents/{agent_id}/messages
+                  - POST /v1/agents/{agent_id}/messages
+                  - POST /v1/agents/{agent_id}/messages/stream
+                  - POST /v1/agents/{agent_id}/messages/async
+                  - POST /v1/agents/{agent_id}/messages/cancel
+                  - POST /v1/agents/{agent_id}/summarize
+                  - POST /v1/agents/{agent_id}/messages/preview-raw-payload
+                  - POST /v1/agents/messages/search
+                  - PATCH /v1/agents/{agent_id}/messages/{message_id}
+                  - PATCH /v1/agents/{agent_id}/reset-messages
+              - section: Folders
+                contents:
+                  - GET /v1/agents/{agent_id}/folders
+                  - PATCH /v1/agents/{agent_id}/folders/attach/{folder_id}
+                  - PATCH /v1/agents/{agent_id}/folders/detach/{folder_id}
+              - section: Files
+                contents:
+                  - GET /v1/agents/{agent_id}/files
+                  - PATCH /v1/agents/{agent_id}/files/{file_id}/open
+                  - PATCH /v1/agents/{agent_id}/files/{file_id}/close
+                  - PATCH /v1/agents/{agent_id}/files/close-all
+              - section: Groups
+                contents:
+                  - GET /v1/agents/{agent_id}/groups
+              - section: Context
+                icon: ban
+                contents:
+                  - GET /v1/agents/{agent_id}/context
+              - section: Core Memory
+                icon: ban
+                contents:
+                  - GET /v1/agents/{agent_id}/core-memory
+              - section: Memory Variables
+                icon: ban
+                contents:
+                  - GET /v1/agents/{agent_id}/core-memory/variables
+              - section: Passages
+                icon: ban
+                contents:
+                  - GET /v1/agents/{agent_id}/archival-memory
+                  - GET /v1/agents/{agent_id}/archival-memory/search
+                  - POST /v1/agents/{agent_id}/archival-memory
+                  - DELETE /v1/agents/{agent_id}/archival-memory/{memory_id}
+              - section: Sources
+                icon: ban
+                contents:
+                  - GET /v1/agents/{agent_id}/sources
+                  - PATCH /v1/agents/{agent_id}/sources/attach/{source_id}
+                  - PATCH /v1/agents/{agent_id}/sources/detach/{source_id}
           - models:
               - GET /v1/models/
               - endpoint: GET /v1/models/embedding
@@ -520,7 +600,8 @@ navigation:
               - POST /v1/blocks/
               - PATCH /v1/blocks/{block_id}
               - DELETE /v1/blocks/{block_id}
-              - GET /v1/blocks/count
+              - endpoint: GET /v1/blocks/count
+                hidden: true
           - identities:
               - GET /v1/identities/
               - GET /v1/identities/{identity_id}
@@ -528,15 +609,19 @@ navigation:
               - PUT /v1/identities/
               - PATCH /v1/identities/{identity_id}
               - DELETE /v1/identities/{identity_id}
-              - GET /v1/identities/count
-          - tools
+              - endpoint: GET /v1/identities/count
+                hidden: true
+          - tools:
+              - endpoint: GET /v1/tools/count
+                hidden: true
           - folders:
               - GET /v1/folders/
               - GET /v1/folders/{folder_id}
               - POST /v1/folders/
               - PATCH /v1/folders/{folder_id}
               - DELETE /v1/folders/{folder_id}
-              - GET /v1/folders/count
+              - endpoint: GET /v1/folders/count
+                hidden: true
           - jobs
           - runs
           - steps
@@ -546,7 +631,8 @@ navigation:
               - POST /v1/groups/
               - PATCH /v1/groups/{group_id}
               - DELETE /v1/groups/{group_id}
-              - GET /v1/groups/count
+              - endpoint: GET /v1/groups/count
+                hidden: true
           - providers:
               - GET /v1/providers/
               - GET /v1/providers/{provider_id}
@@ -605,6 +691,14 @@ navigation:
         contents:
           - page: Overview
             path: pages/cookbooks_simple.mdx
+          - page: Your First Agent
+            path: pages/tutorials/hello_world.mdx
+          - page: Attaching and Detaching Memory Blocks
+            path: pages/tutorials/attaching_detaching_blocks.mdx
+          - page: Shared Memory Blocks
+            path: pages/tutorials/shared-memory-blocks.mdx
+          - page: Talk to Your PDF
+            path: pages/tutorials/pdf_chat.mdx
       - section: Multi-Agent
         contents:
           - page: Async Multi-Agent
@@ -634,6 +728,75 @@ navigation:
           - page: Contributing Results
             path: pages/leaderboard/contributing.mdx
 
+  - tab: evals
+    layout:
+      - link: Chat on Discord
+        icon: fa-brands fa-discord
+        href: https://discord.gg/letta
+      - link: Developer Forum
+        icon: fa-sharp fa-light fa-comments
+        href: https://forum.letta.com
+      - link: DeepLearning.AI Course
+        icon: fa-sharp fa-light fa-building-columns
+        href: https://www.deeplearning.ai/short-courses/llms-as-operating-systems-agent-memory/?utm_campaign=memgpt-launch&utm_content=331638345&utm_medium=social&utm_source=docs&hss_channel=tw-992153930095251456
+      - section: Get Started
+        contents:
+          - page: Overview
+            path: pages/evals/overview.mdx
+          - page: Getting Started
+            path: pages/evals/getting-started.mdx
+      - section: Core Concepts
+        contents:
+          - page: Concepts Overview
+            path: pages/evals/concepts/overview.mdx
+          - page: Suites
+            path: pages/evals/concepts/suites.mdx
+          - page: Datasets
+            path: pages/evals/concepts/datasets.mdx
+          - page: Targets
+            path: pages/evals/concepts/targets.mdx
+          - page: Graders
+            path: pages/evals/concepts/graders.mdx
+          - page: Extractors
+            path: pages/evals/concepts/extractors.mdx
+          - page: Gates
+            path: pages/evals/concepts/gates.mdx
+      - section: Configuration
+        contents:
+          - page: Suite YAML Reference
+            path: pages/evals/configuration/suite-yaml.mdx
+      - section: Graders
+        contents:
+          - page: Tool Graders
+            path: pages/evals/graders/tool-graders.mdx
+          - page: Rubric Graders
+            path: pages/evals/graders/rubric-graders.mdx
+          - page: Multi-Metric Grading
+            path: pages/evals/graders/multi-metric.mdx
+      - section: Extractors
+        contents:
+          - page: Built-in Extractors
+            path: pages/evals/extractors/builtin.mdx
+          - page: Custom Extractors
+            path: pages/evals/extractors/custom.mdx
+      - section: Advanced
+        contents:
+          - page: Custom Graders
+            path: pages/evals/advanced/custom-graders.mdx
+          - page: Multi-Turn Conversations
+            path: pages/evals/advanced/multi-turn-conversations.mdx
+      - section: CLI Reference
+        contents:
+          - page: Commands
+            path: pages/evals/cli/commands.mdx
+      - section: Results & Metrics
+        contents:
+          - page: Understanding Results
+            path: pages/evals/results/overview.mdx
+      - section: Troubleshooting
+        contents:
+          - page: Common Issues
+            path: pages/evals/troubleshooting.mdx
 
   # - tab: cookbooks
   #   layout:
@@ -674,6 +837,11 @@ js:
   - path: assets/leaderboard.js
     strategy: lazyOnload
     # strategy: afterInteractive
+
+analytics:
+  posthog:
+    api-key: ${POSTHOG_KEY}
+    endpoint: https://us.i.posthog.com
 
 favicon: assets/favicon.png
 
@@ -807,3 +975,15 @@ redirects:
     destination: "/api-reference/agents/messages/cancel"
   - source: "/api-reference/messages/cancel-batch-run"
     destination: "/api-reference/batches/cancel"
+  - source: "/guides/agents/architectures"
+    destination: "/guides/legacy/architectures_overview"
+  - source: "/guides/agents/architectures/memgpt"
+    destination: "/guides/legacy/memgpt_agents_legacy"
+  - source: "/guides/agents/heartbeats"
+    destination: "/guides/legacy/heartbeats_legacy"
+  - source: "/guides/agents/architectures/react"
+    destination: "/guides/legacy/react_agents_legacy"
+  - source: "/guides/agents/architectures/workflows"
+    destination: "/guides/legacy/workflows_legacy"
+  - source: "/guides/agents/architectures/low-latency"
+    destination: "/guides/legacy/low_latency_agents_legacy"

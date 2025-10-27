@@ -11,6 +11,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from marshmallow import ValidationError
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -26,29 +27,33 @@ from letta.errors import (
     AgentNotFoundForExportError,
     BedrockPermissionError,
     LettaAgentNotFoundError,
+    LettaExpiredError,
     LettaInvalidArgumentError,
     LettaInvalidMCPSchemaError,
     LettaMCPConnectionError,
     LettaMCPTimeoutError,
+    LettaServiceUnavailableError,
     LettaToolCreateError,
     LettaToolNameConflictError,
+    LettaUnsupportedFileUploadError,
     LettaUserNotFoundError,
     LLMAuthenticationError,
     LLMError,
     LLMRateLimitError,
     LLMTimeoutError,
+    PendingApprovalError,
 )
 from letta.helpers.pinecone_utils import get_pinecone_indices, should_use_pinecone, upsert_pinecone_indices
 from letta.jobs.scheduler import start_scheduler_with_leader_election
 from letta.log import get_logger
 from letta.orm.errors import DatabaseTimeoutError, ForeignKeyConstraintViolationError, NoResultFound, UniqueConstraintViolationError
-from letta.schemas.letta_message import create_letta_message_union_schema
+from letta.otel.tracing import get_trace_id
+from letta.schemas.letta_message import create_letta_message_union_schema, create_letta_ping_schema
 from letta.schemas.letta_message_content import (
     create_letta_assistant_message_content_union_schema,
     create_letta_message_content_union_schema,
     create_letta_user_message_content_union_schema,
 )
-from letta.schemas.letta_ping import create_letta_ping_schema
 from letta.server.constants import REST_DEFAULT_PORT
 from letta.server.db import db_registry
 
@@ -63,6 +68,7 @@ from letta.server.rest_api.static_files import mount_static_files
 from letta.server.rest_api.utils import SENTRY_ENABLED
 from letta.server.server import SyncServer
 from letta.settings import settings, telemetry_settings
+from letta.validators import PATH_VALIDATORS, PRIMITIVE_ID_PATTERNS
 
 if SENTRY_ENABLED:
     import sentry_sdk
@@ -197,7 +203,49 @@ def create_application() -> "FastAPI":
                 "continuous_profiling_auto_start": True,
             },
         )
-        logger.info("Sentry enabled.")
+
+    if telemetry_settings.enable_datadog:
+        try:
+            dd_env = settings.environment or "development"
+            print(f"▶ Initializing Datadog profiling (env={dd_env})")
+
+            # Configure environment variables before importing ddtrace (must be set in environment before importing ddtrace)
+            os.environ.setdefault("DD_ENV", dd_env)
+            os.environ.setdefault("DD_SERVICE", telemetry_settings.datadog_service_name)
+            os.environ.setdefault("DD_VERSION", letta_version)
+            os.environ.setdefault("DD_AGENT_HOST", telemetry_settings.datadog_agent_host)
+            os.environ.setdefault("DD_TRACE_AGENT_PORT", str(telemetry_settings.datadog_agent_port))
+            os.environ.setdefault("DD_PROFILING_ENABLED", "true")
+            os.environ.setdefault("DD_PROFILING_MEMORY_ENABLED", str(telemetry_settings.datadog_profiling_memory_enabled).lower())
+            os.environ.setdefault("DD_PROFILING_HEAP_ENABLED", str(telemetry_settings.datadog_profiling_heap_enabled).lower())
+
+            from ddtrace.profiling import Profiler
+
+            # Initialize and start profiler
+            profiler = Profiler(
+                env=dd_env,
+                service=telemetry_settings.datadog_service_name,
+                version=letta_version,
+            )
+            profiler.start()
+
+            # Log Git metadata for source code integration
+            git_info = ""
+            if telemetry_settings.datadog_git_commit_sha:
+                git_info = f", commit={telemetry_settings.datadog_git_commit_sha[:8]}"
+            if telemetry_settings.datadog_git_repository_url:
+                git_info += f", repo={telemetry_settings.datadog_git_repository_url}"
+
+            logger.info(
+                f"Datadog profiling enabled: env={dd_env}, "
+                f"service={telemetry_settings.datadog_service_name}, "
+                f"agent={telemetry_settings.datadog_agent_host}:{telemetry_settings.datadog_agent_port}{git_info}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize Datadog profiling: {e}", exc_info=True)
+            if SENTRY_ENABLED:
+                sentry_sdk.capture_exception(e)
+            # Don't fail application startup if Datadog initialization fails
 
     debug_mode = "--debug" in sys.argv
     app = FastAPI(
@@ -228,10 +276,67 @@ def create_application() -> "FastAPI":
             },
         )
 
+    # Reasoning for this handler is the default path validation logic returns a pretty gnarly error message
+    # because of the uuid4 pattern. This handler rewrites the error message to be more user-friendly and less intimidating.
+    @app.exception_handler(RequestValidationError)
+    async def custom_request_validation_handler(request: Request, exc: RequestValidationError):
+        """Generalize path `_id` validation messages and include example IDs.
+
+        - Rewrites string pattern/length mismatches to "primitive-{uuid4}"
+        - Preserves stringified `detail` and includes `trace_id`
+        - Adds top-level `examples` from `PATH_VALIDATORS` for offending params
+        """
+        errors = exc.errors()
+        examples_set: set[str] = set()
+        content = {"trace_id": get_trace_id() or ""}
+        for err in errors:
+            fastapi_error_loc = err.get("loc", [])
+            # only rewrite path param validation errors (should expand in future)
+            if len(fastapi_error_loc) != 2 or fastapi_error_loc[0] != "path":
+                continue
+
+            # re-write the error message
+            parameter_name = fastapi_error_loc[1]
+            err_type = err.get("type")
+            if (
+                err_type in {"string_pattern_mismatch", "string_too_short", "string_too_long"}
+                and isinstance(parameter_name, str)
+                and parameter_name.endswith("_id")
+            ):
+                primitive = parameter_name[:-3]
+                validator = PATH_VALIDATORS.get(primitive)
+                if validator:
+                    # simplify default error message
+                    err["msg"] = f"String should match pattern '{primitive}-{{uuid4}}'"
+
+                    # rewrite as string_pattern_mismatch even if the input length is too short or too long (more intuitive for user)
+                    if err_type in {"string_too_short", "string_too_long"}:
+                        # FYI: the pattern is the same as the pattern inthe validator object but for some reason the validator object
+                        # doesn't let you access it directly (unless you call into pydantic layer)
+                        err["ctx"] = {"pattern": PRIMITIVE_ID_PATTERNS[primitive].pattern}
+                    err["type"] = "string_pattern_mismatch"
+
+                    # collect examples for top-level examples field (prevents duplicates and allows for multiple examples for multiple primitives)
+                    # e.g. if there are 2 malformed agent ids, the examples field will contain 2 examples for the agent primitive
+                    # e.g. if there is a malformed agent id and malformed folder id, the examples field will contain both examples, for both the agent and folder primitives
+                    try:
+                        exs = getattr(validator, "examples", None)
+                        if exs:
+                            for ex in exs:
+                                examples_set.add(ex)
+                        else:
+                            examples_set.add(f"{primitive}-123e4567-e89b-42d3-8456-426614174000")
+                    except Exception:
+                        examples_set.add(f"{primitive}-123e4567-e89b-42d3-8456-426614174000")
+
+        # Preserve current API contract: stringified list of errors
+        content["detail"] = repr(errors)
+        if examples_set:
+            content["examples"] = sorted(examples_set)
+        return JSONResponse(status_code=422, content=content)
+
     async def error_handler_with_code(request: Request, exc: Exception, code: int, detail: str | None = None):
         logger.error(f"{type(exc).__name__}", exc_info=exc)
-        if SENTRY_ENABLED:
-            sentry_sdk.capture_exception(exc)
 
         if not detail:
             detail = str(exc)
@@ -246,6 +351,8 @@ def create_application() -> "FastAPI":
     _error_handler_404_user = partial(_error_handler_404, detail="User not found")
     _error_handler_408 = partial(error_handler_with_code, code=408)
     _error_handler_409 = partial(error_handler_with_code, code=409)
+    _error_handler_410 = partial(error_handler_with_code, code=410)
+    _error_handler_415 = partial(error_handler_with_code, code=415)
     _error_handler_422 = partial(error_handler_with_code, code=422)
     _error_handler_500 = partial(error_handler_with_code, code=500)
     _error_handler_503 = partial(error_handler_with_code, code=503)
@@ -263,6 +370,9 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(LettaUserNotFoundError, _error_handler_404_user)
     app.add_exception_handler(AgentNotFoundForExportError, _error_handler_404)
 
+    # 410 Expired errors
+    app.add_exception_handler(LettaExpiredError, _error_handler_410)
+
     # 408 Timeout errors
     app.add_exception_handler(LettaMCPTimeoutError, _error_handler_408)
     app.add_exception_handler(LettaInvalidMCPSchemaError, _error_handler_400)
@@ -271,6 +381,10 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(ForeignKeyConstraintViolationError, _error_handler_409)
     app.add_exception_handler(UniqueConstraintViolationError, _error_handler_409)
     app.add_exception_handler(IntegrityError, _error_handler_409)
+    app.add_exception_handler(PendingApprovalError, _error_handler_409)
+
+    # 415 Unsupported Media Type errors
+    app.add_exception_handler(LettaUnsupportedFileUploadError, _error_handler_415)
 
     # 422 Validation errors
     app.add_exception_handler(ValidationError, _error_handler_422)
@@ -281,6 +395,7 @@ def create_application() -> "FastAPI":
 
     # 503 Service Unavailable errors
     app.add_exception_handler(OperationalError, _error_handler_503)
+    app.add_exception_handler(LettaServiceUnavailableError, _error_handler_503)
 
     @app.exception_handler(IncompatibleAgentType)
     async def handle_incompatible_agent_type(request: Request, exc: IncompatibleAgentType):
@@ -311,8 +426,6 @@ def create_application() -> "FastAPI":
     @app.exception_handler(BedrockPermissionError)
     async def bedrock_permission_error_handler(request, exc: BedrockPermissionError):
         logger.error("Bedrock permission denied.")
-        if SENTRY_ENABLED:
-            sentry_sdk.capture_exception(exc)
 
         return JSONResponse(
             status_code=403,
@@ -439,6 +552,9 @@ def create_application() -> "FastAPI":
             except Exception as e:
                 logger.warning(f"Failed to setup SQLAlchemy instrumentation: {e}")
                 # Don't fail startup if instrumentation fails
+
+        # Ensure our validation handler overrides tracing's handler when tracing is enabled
+        app.add_exception_handler(RequestValidationError, custom_request_validation_handler)
 
     for route in v1_routes:
         app.include_router(route, prefix=API_PREFIX)

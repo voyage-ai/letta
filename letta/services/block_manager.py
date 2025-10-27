@@ -15,11 +15,12 @@ from letta.orm.errors import NoResultFound
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState as PydanticAgentState
 from letta.schemas.block import Block as PydanticBlock, BlockUpdate
-from letta.schemas.enums import ActorType
+from letta.schemas.enums import ActorType, PrimitiveType
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.settings import DatabaseChoice, settings
 from letta.utils import enforce_types
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -134,10 +135,9 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def update_block_async(self, block_id: str, block_update: BlockUpdate, actor: PydanticUser) -> PydanticBlock:
         """Update a block by its ID with the given BlockUpdate object."""
-        # Safety check for block
-
         async with db_registry.async_session() as session:
             block = await BlockModel.read_async(db_session=session, identifier=block_id, actor=actor)
             update_data = block_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
@@ -155,6 +155,7 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def delete_block_async(self, block_id: str, actor: PydanticUser) -> None:
         """Delete a block by its ID."""
         async with db_registry.async_session() as session:
@@ -353,6 +354,7 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def get_block_by_id_async(self, block_id: str, actor: Optional[PydanticUser] = None) -> Optional[PydanticBlock]:
         """Retrieve a block by its name."""
         async with db_registry.async_session() as session:
@@ -412,11 +414,13 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def get_agents_for_block_async(
         self,
         block_id: str,
         actor: PydanticUser,
         include_relationships: Optional[List[str]] = None,
+        include: List[str] = [],
         before: Optional[str] = None,
         after: Optional[str] = None,
         limit: Optional[int] = 50,
@@ -498,7 +502,9 @@ class BlockManager:
             result = await session.execute(query)
             agents_orm = result.scalars().all()
 
-            agents = await asyncio.gather(*[agent.to_pydantic_async(include_relationships=include_relationships) for agent in agents_orm])
+            agents = await asyncio.gather(
+                *[agent.to_pydantic_async(include_relationships=include_relationships, include=include) for agent in agents_orm]
+            )
             return agents
 
     @enforce_types
@@ -595,6 +601,8 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     async def checkpoint_block_async(
         self,
         block_id: str,
@@ -703,6 +711,7 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def undo_checkpoint_block(
         self, block_id: str, actor: PydanticUser, use_preloaded_block: Optional[BlockModel] = None
     ) -> PydanticBlock:
@@ -753,6 +762,7 @@ class BlockManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     async def redo_checkpoint_block(
         self, block_id: str, actor: PydanticUser, use_preloaded_block: Optional[BlockModel] = None
     ) -> PydanticBlock:

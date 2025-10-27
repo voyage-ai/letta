@@ -1,5 +1,4 @@
 import importlib
-import warnings
 from typing import List, Optional, Set, Union
 
 from sqlalchemy import and_, func, or_, select
@@ -13,6 +12,7 @@ from letta.constants import (
     BASE_VOICE_SLEEPTIME_TOOLS,
     BUILTIN_TOOLS,
     FILES_TOOLS,
+    LETTA_PARALLEL_SAFE_TOOLS,
     LETTA_TOOL_MODULE_NAMES,
     LETTA_TOOL_SET,
     LOCAL_ONLY_MULTI_AGENT_TOOLS,
@@ -26,7 +26,7 @@ from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.orm.tool import Tool as ToolModel
 from letta.otel.tracing import trace_method
-from letta.schemas.enums import ToolType
+from letta.schemas.enums import PrimitiveType, ToolType
 from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
@@ -35,6 +35,7 @@ from letta.services.mcp.types import SSEServerConfig, StdioServerConfig
 from letta.services.tool_schema_generator import generate_schema_for_tool_creation, generate_schema_for_tool_update
 from letta.settings import settings
 from letta.utils import enforce_types, printd
+from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
@@ -202,6 +203,7 @@ class ToolManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
     async def get_tool_by_id_async(self, tool_id: str, actor: PydanticUser) -> PydanticTool:
         """Fetch a tool by its ID."""
         async with db_registry.async_session() as session:
@@ -234,6 +236,7 @@ class ToolManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
     async def tool_exists_async(self, tool_id: str, actor: PydanticUser) -> bool:
         """Check if a tool exists and belongs to the user's organization (lightweight check)."""
         async with db_registry.async_session() as session:
@@ -506,6 +509,7 @@ class ToolManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
     async def update_tool_by_id_async(
         self,
         tool_id: str,
@@ -603,6 +607,7 @@ class ToolManager:
 
     @enforce_types
     @trace_method
+    # @raise_on_invalid_id This is commented out bc it's called by _list_tools_async, when it encounters malformed tools (i.e. if id is invalid will fail validation on deletion)
     async def delete_tool_by_id_async(self, tool_id: str, actor: PydanticUser) -> None:
         """Delete a tool by its ID."""
         async with db_registry.async_session() as session:
@@ -630,7 +635,7 @@ class ToolManager:
                 module = importlib.import_module(module_name)
                 functions_to_schema.update(load_function_set(module))
             except ValueError as e:
-                warnings.warn(f"Error loading function set '{module_name}': {e}")
+                logger.warning(f"Error loading function set '{module_name}': {e}")
             except Exception as e:
                 raise e
 
@@ -662,12 +667,14 @@ class ToolManager:
                 continue
 
             # create pydantic tool for validation and conversion
+            parallel_safe = name in LETTA_PARALLEL_SAFE_TOOLS
             pydantic_tool = PydanticTool(
                 name=name,
                 tags=[tool_type.value],
                 source_type="python",
                 tool_type=tool_type,
                 return_char_limit=BASE_FUNCTION_RETURN_CHAR_LIMIT,
+                enable_parallel_execution=parallel_safe,
             )
 
             # auto-generate description if not provided

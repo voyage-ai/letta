@@ -439,6 +439,7 @@ class AnthropicClient(LLMClientBase):
             llm_config.model.startswith("claude-3-7-sonnet")
             or llm_config.model.startswith("claude-sonnet-4")
             or llm_config.model.startswith("claude-opus-4")
+            or llm_config.model.startswith("claude-haiku-4-5")
         )
 
     @trace_method
@@ -575,7 +576,7 @@ class AnthropicClient(LLMClientBase):
         reasoning_content = None
         reasoning_content_signature = None
         redacted_reasoning_content = None
-        tool_calls = None
+        tool_calls: list[ToolCall] = []
 
         if len(response.content) > 0:
             for content_part in response.content:
@@ -585,6 +586,8 @@ class AnthropicClient(LLMClientBase):
                     # hack for incorrect tool format
                     tool_input = json.loads(json.dumps(content_part.input))
                     if "id" in tool_input and tool_input["id"].startswith("toolu_") and "function" in tool_input:
+                        if isinstance(tool_input["function"], str):
+                            tool_input["function"] = json.loads(tool_input["function"])
                         arguments = json.dumps(tool_input["function"]["arguments"], indent=2)
                         try:
                             args_json = json.loads(arguments)
@@ -594,7 +597,7 @@ class AnthropicClient(LLMClientBase):
                             arguments = str(tool_input["function"]["arguments"])
                     else:
                         arguments = json.dumps(tool_input, indent=2)
-                    tool_calls = [
+                    tool_calls.append(
                         ToolCall(
                             id=content_part.id,
                             type="function",
@@ -603,7 +606,7 @@ class AnthropicClient(LLMClientBase):
                                 arguments=arguments,
                             ),
                         )
-                    ]
+                    )
                 if content_part.type == "thinking":
                     reasoning_content = content_part.thinking
                     reasoning_content_signature = content_part.signature
@@ -623,7 +626,7 @@ class AnthropicClient(LLMClientBase):
                 reasoning_content=reasoning_content,
                 reasoning_content_signature=reasoning_content_signature,
                 redacted_reasoning_content=redacted_reasoning_content,
-                tool_calls=tool_calls,
+                tool_calls=tool_calls or None,
             ),
         )
 

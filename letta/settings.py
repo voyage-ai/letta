@@ -6,9 +6,12 @@ from typing import Optional
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from letta.local_llm.constants import DEFAULT_WRAPPER_NAME, INNER_THOUGHTS_KWARG
 from letta.schemas.enums import SandboxType
 from letta.services.summarizer.enums import SummarizationMode
+
+# Define constants here to avoid circular import with letta.log
+DEFAULT_WRAPPER_NAME = "chatml"
+INNER_THOUGHTS_KWARG = "thinking"
 
 
 class ToolSettings(BaseSettings):
@@ -332,6 +335,10 @@ class Settings(BaseSettings):
     file_processing_timeout_minutes: int = 30
     file_processing_timeout_error_message: str = "File processing timed out after {} minutes. Please try again."
 
+    # Letta client settings for tool execution
+    default_base_url: str = Field(default="http://localhost:8283", description="Default base URL for Letta client in tool execution")
+    default_token: Optional[str] = Field(default=None, description="Default token for Letta client in tool execution")
+
     # enabling letta_agent_v1 architecture
     use_letta_v1_agent: bool = False
 
@@ -377,16 +384,53 @@ class TestSettings(Settings):
 
 class LogSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="letta_logging_", extra="ignore")
-    debug: bool | None = Field(False, description="Enable debugging for logging")
-    json_logging: bool = Field(False, description="Enable json logging instead of text logging")
+    debug: bool = Field(default=False, description="Enable debugging for logging")
+    json_logging: bool = Field(
+        default=False,
+        description="Enable structured JSON logging (recommended).",
+    )
     log_level: str | None = Field("WARNING", description="Logging level")
     letta_log_path: Path | None = Field(Path.home() / ".letta" / "logs" / "Letta.log")
-    verbose_telemetry_logging: bool = Field(False)
+    verbose_telemetry_logging: bool = Field(default=False)
 
 
 class TelemetrySettings(BaseSettings):
+    """Configuration for telemetry and observability integrations."""
+
     model_config = SettingsConfigDict(env_prefix="letta_telemetry_", extra="ignore")
-    profiler: bool | None = Field(False, description="Enable use of the profiler.")
+
+    # Google Cloud Profiler
+    profiler: bool = Field(default=False, description="Enable Google Cloud Profiler.")
+
+    # Datadog APM and Profiling
+    enable_datadog: bool = Field(default=False, description="Enable Datadog profiling. Environment is pulled from settings.environment.")
+    datadog_agent_host: str = Field(
+        default="localhost",
+        description="Datadog agent hostname or IP address. Use service name for Kubernetes (e.g., 'datadog-cluster-agent').",
+    )
+    datadog_agent_port: int = Field(default=8126, ge=1, le=65535, description="Datadog trace agent port (typically 8126 for traces).")
+    datadog_service_name: str = Field(default="letta-server", description="Service name for Datadog profiling.")
+    datadog_profiling_memory_enabled: bool = Field(default=False, description="Enable memory profiling in Datadog.")
+    datadog_profiling_heap_enabled: bool = Field(default=False, description="Enable heap profiling in Datadog.")
+
+    # Datadog Source Code Integration (optional, tightly coupled with profiling)
+    # These settings link profiling data and traces to specific Git commits,
+    # enabling code navigation directly from Datadog UI to GitHub/GitLab.
+    datadog_git_repository_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DD_GIT_REPOSITORY_URL", "datadog_git_repository_url"),
+        description="Git repository URL (e.g., 'https://github.com/org/repo'). Set at build time.",
+    )
+    datadog_git_commit_sha: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DD_GIT_COMMIT_SHA", "datadog_git_commit_sha"),
+        description="Git commit SHA for the deployed code. Set at build time with 'git rev-parse HEAD'.",
+    )
+    datadog_main_package: str = Field(
+        default="letta",
+        validation_alias=AliasChoices("DD_MAIN_PACKAGE", "datadog_main_package"),
+        description="Primary Python package name for source code linking. Datadog uses this setting to determine which code is 'yours' vs. third-party dependencies.",
+    )
 
 
 # singleton

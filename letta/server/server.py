@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import traceback
-import warnings
 from abc import abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -94,6 +93,7 @@ from letta.services.mcp.base_client import AsyncBaseMCPClient
 from letta.services.mcp.sse_client import MCP_CONFIG_TOPLEVEL_KEY, AsyncSSEMCPClient
 from letta.services.mcp.stdio_client import AsyncStdioMCPClient
 from letta.services.mcp_manager import MCPManager
+from letta.services.mcp_server_manager import MCPServerManager
 from letta.services.message_manager import MessageManager
 from letta.services.organization_manager import OrganizationManager
 from letta.services.passage_manager import PassageManager
@@ -154,6 +154,7 @@ class SyncServer(object):
         self.user_manager = UserManager()
         self.tool_manager = ToolManager()
         self.mcp_manager = MCPManager()
+        self.mcp_server_manager = MCPServerManager()
         self.block_manager = BlockManager()
         self.source_manager = SourceManager()
         self.sandbox_config_manager = SandboxConfigManager()
@@ -482,8 +483,21 @@ class SyncServer(object):
         request: UpdateAgent,
         actor: User,
     ) -> AgentState:
-        if request.model is not None:
-            request.llm_config = await self.get_llm_config_from_handle_async(handle=request.model, actor=actor)
+        # Build llm_config from convenience fields if llm_config is not provided
+        if request.llm_config is None and (
+            request.model is not None or request.context_window_limit is not None or request.max_tokens is not None
+        ):
+            if request.model is None:
+                agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+                request.model = agent.llm_config.handle
+            config_params = {
+                "handle": request.model,
+                "context_window_limit": request.context_window_limit,
+                "max_tokens": request.max_tokens,
+            }
+            log_event(name="start get_cached_llm_config", attributes=config_params)
+            request.llm_config = await self.get_cached_llm_config_async(actor=actor, **config_params)
+            log_event(name="end get_cached_llm_config", attributes=config_params)
 
         if request.embedding is not None:
             request.embedding_config = await self.get_embedding_config_from_handle_async(handle=request.embedding, actor=actor)
@@ -761,8 +775,6 @@ class SyncServer(object):
 
         # TODO: move this into a thread
         source = await self.source_manager.get_source_by_id(source_id=source_id)
-        if source is None:
-            raise NoResultFound(f"Source {source_id} does not exist")
         connector = DirectoryConnector(input_files=[file_path])
         num_passages, num_documents = await self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
 
@@ -925,11 +937,10 @@ class SyncServer(object):
                 async with asyncio.timeout(constants.GET_PROVIDERS_TIMEOUT_SECONDS):
                     return await provider.list_llm_models_async()
             except asyncio.TimeoutError:
-                warnings.warn(f"Timeout while listing LLM models for provider {provider}")
+                logger.warning(f"Timeout while listing LLM models for provider {provider}")
                 return []
             except Exception as e:
-                traceback.print_exc()
-                warnings.warn(f"Error while listing LLM models for provider {provider}: {e}")
+                logger.exception(f"Error while listing LLM models for provider {provider}: {e}")
                 return []
 
         # Execute all provider model listing tasks concurrently
@@ -968,10 +979,7 @@ class SyncServer(object):
                 # All providers now have list_embedding_models_async
                 return await provider.list_embedding_models_async()
             except Exception as e:
-                import traceback
-
-                traceback.print_exc()
-                warnings.warn(f"An error occurred while listing embedding models for provider {provider}: {e}")
+                logger.exception(f"An error occurred while listing embedding models for provider {provider}: {e}")
                 return []
 
         # Execute all provider model listing tasks concurrently
@@ -1140,9 +1148,9 @@ class SyncServer(object):
         #                        llm_config = LLMConfig(**config_data)
         #                        llm_models.append(llm_config)
         #                except (json.JSONDecodeError, ValueError) as e:
-        #                    warnings.warn(f"Error parsing LLM config file {filename}: {e}")
+        #                    logger.warning(f"Error parsing LLM config file {filename}: {e}")
         # except Exception as e:
-        #    warnings.warn(f"Error reading LLM configs directory: {e}")
+        #    logger.warning(f"Error reading LLM configs directory: {e}")
         return llm_models
 
     def get_local_embedding_configs(self):
@@ -1160,9 +1168,9 @@ class SyncServer(object):
         #                        embedding_config = EmbeddingConfig(**config_data)
         #                        embedding_models.append(embedding_config)
         #                except (json.JSONDecodeError, ValueError) as e:
-        #                    warnings.warn(f"Error parsing embedding config file {filename}: {e}")
+        #                    logger.warning(f"Error parsing embedding config file {filename}: {e}")
         # except Exception as e:
-        #    warnings.warn(f"Error reading embedding configs directory: {e}")
+        #    logger.warning(f"Error reading embedding configs directory: {e}")
         return embedding_models
 
     def add_llm_model(self, request: LLMConfig) -> LLMConfig:
@@ -1501,7 +1509,7 @@ class SyncServer(object):
             # supports_token_streaming = ["openai", "anthropic", "xai", "deepseek"]
             supports_token_streaming = ["openai", "anthropic", "deepseek"]  # TODO re-enable xAI once streaming is patched
             if stream_tokens and (llm_config.model_endpoint_type not in supports_token_streaming):
-                warnings.warn(
+                logger.warning(
                     f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
                 )
                 stream_tokens = False
@@ -1603,10 +1611,7 @@ class SyncServer(object):
         except HTTPException:
             raise
         except Exception as e:
-            print(e)
-            import traceback
-
-            traceback.print_exc()
+            logger.exception(f"Error sending message to agent: {e}")
             raise HTTPException(status_code=500, detail=f"{e}")
 
     @trace_method
@@ -1636,7 +1641,7 @@ class SyncServer(object):
         llm_config = letta_multi_agent.agent_state.llm_config
         supports_token_streaming = ["openai", "anthropic", "deepseek"]
         if stream_tokens and (llm_config.model_endpoint_type not in supports_token_streaming):
-            warnings.warn(
+            logger.warning(
                 f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
             )
             stream_tokens = False

@@ -1,12 +1,20 @@
-from typing import TYPE_CHECKING, List, Literal, Optional
+from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, Header, Query
 
 from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
-from letta.schemas.agent import AgentState
+from letta.schemas.agent import AgentRelationships, AgentState
 from letta.schemas.block import Block
-from letta.schemas.identity import Identity, IdentityCreate, IdentityProperty, IdentityType, IdentityUpdate, IdentityUpsert
+from letta.schemas.identity import (
+    Identity,
+    IdentityCreate,
+    IdentityProperty,
+    IdentityType,
+    IdentityUpdate,
+    IdentityUpsert,
+)
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
+from letta.validators import IdentityId
 
 if TYPE_CHECKING:
     from letta.server.server import SyncServer
@@ -41,7 +49,7 @@ async def list_identities(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
 
-    identities = await server.identity_manager.list_identities_async(
+    identities, next_cursor, has_more = await server.identity_manager.list_identities_async(
         name=name,
         project_id=project_id,
         identifier_key=identifier_key,
@@ -52,6 +60,7 @@ async def list_identities(
         ascending=(order == "asc"),
         actor=actor,
     )
+
     return identities
 
 
@@ -72,7 +81,7 @@ async def count_identities(
 
 @router.get("/{identity_id}", tags=["identities"], response_model=Identity, operation_id="retrieve_identity")
 async def retrieve_identity(
-    identity_id: str,
+    identity_id: IdentityId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -108,7 +117,7 @@ async def upsert_identity(
 
 @router.patch("/{identity_id}", tags=["identities"], response_model=Identity, operation_id="update_identity")
 async def modify_identity(
-    identity_id: str,
+    identity_id: IdentityId,
     identity: IdentityUpdate = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -119,7 +128,7 @@ async def modify_identity(
 
 @router.put("/{identity_id}/properties", tags=["identities"], operation_id="upsert_identity_properties")
 async def upsert_identity_properties(
-    identity_id: str,
+    identity_id: IdentityId,
     properties: List[IdentityProperty] = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
@@ -130,7 +139,7 @@ async def upsert_identity_properties(
 
 @router.delete("/{identity_id}", tags=["identities"], operation_id="delete_identity")
 async def delete_identity(
-    identity_id: str,
+    identity_id: IdentityId,
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -143,7 +152,7 @@ async def delete_identity(
 
 @router.get("/{identity_id}/agents", response_model=List[AgentState], operation_id="list_agents_for_identity")
 async def list_agents_for_identity(
-    identity_id: str,
+    identity_id: IdentityId,
     before: Optional[str] = Query(
         None,
         description="Agent ID cursor for pagination. Returns agents that come before this agent ID in the specified sort order",
@@ -157,6 +166,10 @@ async def list_agents_for_identity(
         "desc", description="Sort order for agents by creation time. 'asc' for oldest first, 'desc' for newest first"
     ),
     order_by: Literal["created_at"] = Query("created_at", description="Field to sort by"),
+    include: List[AgentRelationships] = Query(
+        [],
+        description=("Specify which relational fields to include in the response. No relationships are included by default."),
+    ),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -170,13 +183,14 @@ async def list_agents_for_identity(
         after=after,
         limit=limit,
         ascending=(order == "asc"),
+        include=include,
         actor=actor,
     )
 
 
 @router.get("/{identity_id}/blocks", response_model=List[Block], operation_id="list_blocks_for_identity")
 async def list_blocks_for_identity(
-    identity_id: str,
+    identity_id: IdentityId,
     before: Optional[str] = Query(
         None,
         description="Block ID cursor for pagination. Returns blocks that come before this block ID in the specified sort order",

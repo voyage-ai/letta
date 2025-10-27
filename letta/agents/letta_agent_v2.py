@@ -1,4 +1,4 @@
-import asyncio
+import json
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Optional, Tuple
@@ -19,7 +19,7 @@ from letta.agents.helpers import (
     _safe_load_tool_call_str,
     generate_step_id,
 )
-from letta.constants import DEFAULT_MAX_STEPS, NON_USER_MSG_PREFIX
+from letta.constants import DEFAULT_MAX_STEPS, NON_USER_MSG_PREFIX, REQUEST_HEARTBEAT_PARAM
 from letta.errors import ContextWindowExceededError, LLMError
 from letta.helpers import ToolRulesSolver
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns, ns_to_ms
@@ -37,9 +37,10 @@ from letta.schemas.letta_message_content import OmittedReasoningContent, Reasoni
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message, MessageCreate, MessageUpdate
-from letta.schemas.openai.chat_completion_response import ToolCall, UsageStatistics
+from letta.schemas.openai.chat_completion_response import FunctionCall, ToolCall, UsageStatistics
 from letta.schemas.step import Step, StepProgression
 from letta.schemas.step_metrics import StepMetrics
+from letta.schemas.tool import Tool
 from letta.schemas.tool_execution_result import ToolExecutionResult
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
@@ -470,7 +471,7 @@ class LettaAgentV2(BaseAgentV2):
             # Handle the AI response with the extracted data
             if tool_call is None and llm_adapter.tool_call is None:
                 self.stop_reason = LettaStopReason(stop_reason=StopReasonType.no_tool_call.value)
-                raise ValueError("No tool calls found in response, model must make a tool call")
+                raise LLMError("No tool calls found in response, model must make a tool call")
 
             # TODO: how should be associate input messages with runs?
             ## Set run_id on input messages before persisting
@@ -535,7 +536,7 @@ class LettaAgentV2(BaseAgentV2):
                 )
             step_progression, step_metrics = await self._step_checkpoint_finish(step_metrics, agent_step_span, logged_step)
         except Exception as e:
-            self.logger.error(f"Error during step processing: {e}")
+            self.logger.warning(f"Error during step processing: {e}")
             self.job_update_metadata = {"error": str(e)}
 
             # This indicates we failed after we decided to stop stepping, which indicates a bug with our flow.
@@ -699,7 +700,10 @@ class LettaAgentV2(BaseAgentV2):
 
         # generate just the memory string with current state for comparison
         curr_memory_str = agent_state.memory.compile(
-            tool_usage_rules=tool_constraint_block, sources=agent_state.sources, max_files_open=agent_state.max_files_open
+            tool_usage_rules=tool_constraint_block,
+            sources=agent_state.sources,
+            max_files_open=agent_state.max_files_open,
+            llm_config=agent_state.llm_config,
         )
         new_dynamic_section = extract_dynamic_section(curr_memory_str)
 
@@ -933,20 +937,19 @@ class LettaAgentV2(BaseAgentV2):
         )
 
         if not is_approval and tool_rules_solver.is_requires_approval_tool(tool_call_name):
-            approval_message = create_approval_request_message_from_llm_response(
+            tool_args[REQUEST_HEARTBEAT_PARAM] = request_heartbeat
+            approval_messages = create_approval_request_message_from_llm_response(
                 agent_id=agent_state.id,
                 model=agent_state.llm_config.model,
-                function_name=tool_call_name,
-                function_arguments=tool_args,
-                tool_call_id=tool_call_id,
-                actor=self.actor,
-                continue_stepping=request_heartbeat,
+                requested_tool_calls=[
+                    ToolCall(id=tool_call_id, function=FunctionCall(name=tool_call_name, arguments=json.dumps(tool_args)))
+                ],
                 reasoning_content=reasoning_content,
                 pre_computed_assistant_message_id=pre_computed_assistant_message_id,
                 step_id=step_id,
                 run_id=run_id,
             )
-            messages_to_persist = (initial_messages or []) + [approval_message]
+            messages_to_persist = (initial_messages or []) + approval_messages
             continue_stepping = False
             stop_reason = LettaStopReason(stop_reason=StopReasonType.requires_approval.value)
         else:
@@ -957,8 +960,10 @@ class LettaAgentV2(BaseAgentV2):
             else:
                 # Track tool execution time
                 tool_start_time = get_utc_timestamp_ns()
+                target_tool = next((x for x in agent_state.tools if x.name == tool_call_name), None)
+
                 tool_execution_result = await self._execute_tool(
-                    tool_name=tool_call_name,
+                    target_tool=target_tool,
                     tool_args=tool_args,
                     agent_state=agent_state,
                     agent_step_span=agent_step_span,
@@ -1079,20 +1084,20 @@ class LettaAgentV2(BaseAgentV2):
     @trace_method
     async def _execute_tool(
         self,
-        tool_name: str,
+        target_tool: Tool,
         tool_args: JsonDict,
         agent_state: AgentState,
         agent_step_span: Span | None = None,
         step_id: str | None = None,
-        run_id: str = None,
     ) -> "ToolExecutionResult":
         """
         Executes a tool and returns the ToolExecutionResult.
         """
         from letta.schemas.tool_execution_result import ToolExecutionResult
 
+        tool_name = target_tool.name
+
         # Special memory case
-        target_tool = next((x for x in agent_state.tools if x.name == tool_name), None)
         if not target_tool:
             # TODO: fix this error message
             return ToolExecutionResult(
@@ -1106,7 +1111,8 @@ class LettaAgentV2(BaseAgentV2):
             start_time = get_utc_timestamp_ns()
             agent_step_span.add_event(name="tool_execution_started")
 
-        sandbox_env_vars = {var.key: var.value for var in agent_state.secrets}
+        # Decrypt environment variable values
+        sandbox_env_vars = {var.key: var.get_value_secret().get_plaintext() for var in agent_state.secrets}
         tool_execution_manager = ToolExecutionManager(
             agent_state=agent_state,
             message_manager=self.message_manager,
@@ -1158,25 +1164,29 @@ class LettaAgentV2(BaseAgentV2):
         # TODO: This can be broken by bad configs, e.g. lower bound too high, initial messages too fat, etc.
         # TODO: `force` and `clear` seem to no longer be used, we should remove
         if not skip_summarization:
-            if force or (total_tokens and total_tokens > self.agent_state.llm_config.context_window):
-                self.logger.warning(
-                    f"Total tokens {total_tokens} exceeds configured max tokens {self.agent_state.llm_config.context_window}, forcefully clearing message history."
-                )
-                new_in_context_messages, updated = await self.summarizer.summarize(
-                    in_context_messages=in_context_messages,
-                    new_letta_messages=new_letta_messages,
-                    force=True,
-                    clear=True,
-                )
-            else:
-                # NOTE (Sarah): Seems like this is doing nothing?
-                self.logger.info(
-                    f"Total tokens {total_tokens} does not exceed configured max tokens {self.agent_state.llm_config.context_window}, passing summarizing w/o force."
-                )
-                new_in_context_messages, updated = await self.summarizer.summarize(
-                    in_context_messages=in_context_messages,
-                    new_letta_messages=new_letta_messages,
-                )
+            try:
+                if force or (total_tokens and total_tokens > self.agent_state.llm_config.context_window):
+                    self.logger.warning(
+                        f"Total tokens {total_tokens} exceeds configured max tokens {self.agent_state.llm_config.context_window}, forcefully clearing message history."
+                    )
+                    new_in_context_messages, updated = await self.summarizer.summarize(
+                        in_context_messages=in_context_messages,
+                        new_letta_messages=new_letta_messages,
+                        force=True,
+                        clear=True,
+                    )
+                else:
+                    # NOTE (Sarah): Seems like this is doing nothing?
+                    self.logger.info(
+                        f"Total tokens {total_tokens} does not exceed configured max tokens {self.agent_state.llm_config.context_window}, passing summarizing w/o force."
+                    )
+                    new_in_context_messages, updated = await self.summarizer.summarize(
+                        in_context_messages=in_context_messages,
+                        new_letta_messages=new_letta_messages,
+                    )
+            except Exception as e:
+                self.logger.error(f"Failed to summarize conversation history: {e}")
+                new_in_context_messages = in_context_messages + new_letta_messages
         else:
             new_in_context_messages = in_context_messages + new_letta_messages
 

@@ -294,6 +294,7 @@ SNIPPET_LINES: int = 4
 def memory_replace(agent_state: "AgentState", label: str, old_str: str, new_str: str) -> str:  # type: ignore
     """
     The memory_replace command allows you to replace a specific string in a memory block with a new string. This is used for making precise edits.
+    Do NOT attempt to replace long strings, e.g. do not attempt to replace the entire contents of a memory block with a new string.
 
     Args:
         label (str): Section of the memory to be edited, identified by its label.
@@ -311,10 +312,10 @@ def memory_replace(agent_state: "AgentState", label: str, old_str: str, new_str:
         memory_replace(label="human", old_str="Their name is Alice", new_str="")
 
         # Bad example - do NOT add (view-only) line numbers to the args
-        memory_replace(label="human", old_str="Line 1: Their name is Alice", new_str="Line 1: Their name is Bob")
+        memory_replace(label="human", old_str="1: Their name is Alice", new_str="1: Their name is Bob")
 
-        # Bad example - do NOT include the number number warning either
-        memory_replace(label="human", old_str="# NOTE: Line numbers shown below are to help during editing. Do NOT include line number prefixes in your memory edit tool calls.\\nLine 1: Their name is Alice", new_str="Line 1: Their name is Bob")
+        # Bad example - do NOT include the line number warning either
+        memory_replace(label="human", old_str="# NOTE: Line numbers shown below (with arrows like '1→') are to help during editing. Do NOT include line number prefixes in your memory edit tool calls.\\n1→ Their name is Alice", new_str="1→ Their name is Bob")
 
         # Good example - no line numbers or line number warning (they are view-only), just the text
         memory_replace(label="human", old_str="Their name is Alice", new_str="Their name is Bob")
@@ -447,6 +448,57 @@ def memory_insert(agent_state: "AgentState", label: str, new_str: str, insert_li
     success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the memory block again if necessary."
 
     return success_msg
+
+
+def memory_apply_patch(agent_state: "AgentState", label: str, patch: str) -> str:  # type: ignore
+    """
+    Apply a unified-diff style patch to a memory block by anchoring on content and context (not line numbers).
+
+    The patch format is a simplified unified diff that supports one or more hunks. Each hunk may optionally
+    start with a line beginning with `@@` and then contains lines that begin with one of:
+    - " " (space): context lines that must match the current memory content
+    - "-": lines to remove (must match exactly in the current content)
+    - "+": lines to add
+
+    Notes:
+    - Do not include line number prefixes like "Line 12:" anywhere in the patch. Line numbers are for display only.
+    - Do not include the line-number warning banner. Provide only the text to edit.
+    - Tabs are normalized to spaces for matching consistency.
+
+    Args:
+        label (str): The memory block to edit, identified by its label.
+        patch (str): The simplified unified-diff patch text composed of context (" "), deletion ("-"), and addition ("+") lines. Optional
+            lines beginning with "@@" can be used to delimit hunks. Do not include visual line numbers or warning banners.
+
+    Examples:
+        Simple replacement:
+            label="human",
+            patch:
+                @@
+                -Their name is Alice
+                +Their name is Bob
+
+        Replacement with surrounding context for disambiguation:
+            label="persona",
+            patch:
+                @@
+                 Persona:
+                -Friendly and curious
+                +Friendly, curious, and precise
+                 Likes: Hiking
+
+        Insertion (no deletions) between two context lines:
+            label="todos",
+            patch:
+                @@
+                 - [ ] Step 1: Gather requirements
+                 + [ ] Step 1.5: Clarify stakeholders
+                 - [ ] Step 2: Draft design
+
+    Returns:
+        str: A success message if the patch applied cleanly; raises ValueError otherwise.
+    """
+    raise NotImplementedError("This should never be invoked directly. Contact Letta if you see this error message.")
 
 
 def memory_rethink(agent_state: "AgentState", label: str, new_memory: str) -> None:

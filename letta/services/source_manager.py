@@ -11,11 +11,12 @@ from letta.orm.source import Source as SourceModel
 from letta.orm.sources_agents import SourcesAgents
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState as PydanticAgentState
-from letta.schemas.enums import VectorDBProvider
+from letta.schemas.enums import PrimitiveType, VectorDBProvider
 from letta.schemas.source import Source as PydanticSource, SourceUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.utils import enforce_types, printd
+from letta.validators import raise_on_invalid_id
 
 
 class SourceManager:
@@ -61,7 +62,11 @@ class SourceManager:
     @trace_method
     async def create_source(self, source: PydanticSource, actor: PydanticUser) -> PydanticSource:
         """Create a new source based on the PydanticSource schema."""
-        db_source = await self.get_source_by_id(source.id, actor=actor)
+        try:
+            db_source = await self.get_source_by_id(source.id, actor=actor)
+        except NoResultFound:
+            db_source = None
+
         if db_source:
             return db_source
         else:
@@ -197,6 +202,7 @@ class SourceManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def update_source(self, source_id: str, source_update: SourceUpdate, actor: PydanticUser) -> PydanticSource:
         """Update a source by its ID with the given SourceUpdate object."""
         async with db_registry.async_session() as session:
@@ -220,6 +226,7 @@ class SourceManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def delete_source(self, source_id: str, actor: PydanticUser) -> PydanticSource:
         """Delete a source by its ID."""
         async with db_registry.async_session() as session:
@@ -264,6 +271,7 @@ class SourceManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def list_attached_agents(
         self, source_id: str, actor: PydanticUser, ids_only: bool = False
     ) -> Union[List[PydanticAgentState], List[str]]:
@@ -317,6 +325,7 @@ class SourceManager:
 
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def get_agents_for_source_id(self, source_id: str, actor: PydanticUser) -> List[str]:
         """
         Get all agent IDs associated with a given source ID.
@@ -343,14 +352,12 @@ class SourceManager:
     # TODO: We make actor optional for now, but should most likely be enforced due to security reasons
     @enforce_types
     @trace_method
+    @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
     async def get_source_by_id(self, source_id: str, actor: Optional[PydanticUser] = None) -> Optional[PydanticSource]:
         """Retrieve a source by its ID."""
         async with db_registry.async_session() as session:
-            try:
-                source = await SourceModel.read_async(db_session=session, identifier=source_id, actor=actor)
-                return source.to_pydantic()
-            except NoResultFound:
-                return None
+            source = await SourceModel.read_async(db_session=session, identifier=source_id, actor=actor)
+            return source.to_pydantic()
 
     @enforce_types
     @trace_method
@@ -364,7 +371,7 @@ class SourceManager:
                 limit=1,
             )
             if not sources:
-                return None
+                raise NoResultFound(f"Source with name={source_name} not found.")
             else:
                 return sources[0].to_pydantic()
 

@@ -1,6 +1,32 @@
 from enum import Enum, StrEnum
 
 
+class PrimitiveType(str, Enum):
+    """
+    Enum for all primitive resource types in Letta.
+
+    The enum values ARE the actual ID prefixes used in the system.
+    This serves as the single source of truth for all ID prefixes.
+    """
+
+    AGENT = "agent"
+    MESSAGE = "message"
+    RUN = "run"
+    JOB = "job"
+    GROUP = "group"
+    BLOCK = "block"
+    FILE = "file"
+    FOLDER = "source"  # Note: folder IDs use "source" prefix for historical reasons
+    SOURCE = "source"
+    TOOL = "tool"
+    ARCHIVE = "archive"
+    PASSAGE = "passage"
+    PROVIDER = "provider"
+    SANDBOX_CONFIG = "sandbox"  # Note: sandbox_config IDs use "sandbox" prefix
+    STEP = "step"
+    IDENTITY = "identity"
+
+
 class ProviderType(str, Enum):
     anthropic = "anthropic"
     azure = "azure"
@@ -153,11 +179,10 @@ class ToolType(str, Enum):
     LETTA_VOICE_SLEEPTIME_CORE = "letta_voice_sleeptime_core"
     LETTA_BUILTIN = "letta_builtin"
     LETTA_FILES_CORE = "letta_files_core"
-    EXTERNAL_LANGCHAIN = "external_langchain" # DEPRECATED
-    EXTERNAL_COMPOSIO = "external_composio" # DEPRECATED
+    EXTERNAL_LANGCHAIN = "external_langchain"  # DEPRECATED
+    EXTERNAL_COMPOSIO = "external_composio"  # DEPRECATED
     # TODO is "external" the right name here? Since as of now, MCP is local / doesn't support remote?
     EXTERNAL_MCP = "external_mcp"
-
 
 
 class JobType(str, Enum):
@@ -223,3 +248,11 @@ class TagMatchMode(str, Enum):
 
     ANY = "any"
     ALL = "all"
+
+
+class ComparisonOperator(str, Enum):
+    """Comparison operators for filtering numeric values"""
+
+    EQ = "eq"  # equals
+    GTE = "gte"  # greater than or equal
+    LTE = "lte"  # less than or equal

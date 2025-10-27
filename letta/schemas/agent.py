@@ -1,15 +1,18 @@
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
-from letta.schemas.block import CreateBlock
+from letta.errors import AgentExportProcessingError
+from letta.schemas.block import Block, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
+from letta.schemas.enums import PrimitiveType
 from letta.schemas.environment_variables import AgentEnvironmentVariable
 from letta.schemas.file import FileStatus
 from letta.schemas.group import Group
+from letta.schemas.identity import Identity
 from letta.schemas.letta_base import OrmMetadataBase
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
@@ -40,6 +43,18 @@ class AgentType(str, Enum):
     voice_sleeptime_agent = "voice_sleeptime_agent"
 
 
+# Relationship field literal type for AgentState include field to join related objects
+AgentRelationships = Literal[
+    "agent.blocks",
+    "agent.identities",
+    "agent.managed_group",
+    "agent.secrets",
+    "agent.sources",
+    "agent.tags",
+    "agent.tools",
+]
+
+
 class AgentState(OrmMetadataBase, validate_assignment=True):
     """
     Representation of an agent's state. This is the state of the agent at a given time, and is persisted in the DB backend. The state has all the information needed to recreate a persisted agent.
@@ -56,7 +71,7 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
         embedding_config (EmbeddingConfig): The embedding configuration used by the agent.
     """
 
-    __id_prefix__ = "agent"
+    __id_prefix__ = PrimitiveType.AGENT.value
 
     # NOTE: this is what is returned to the client and also what is used to initialize `Agent`
     id: str = Field(..., description="The id of the agent. Assigned by the database.")
@@ -84,7 +99,8 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     description: Optional[str] = Field(None, description="The description of the agent.")
     metadata: Optional[Dict] = Field(None, description="The metadata of the agent.")
 
-    memory: Memory = Field(..., description="The in-context memory of the agent.")
+    memory: Memory = Field(..., description="The in-context memory of the agent.", deprecated=True)
+    blocks: List[Block] = Field(..., description="The memory blocks used by the agent.")
     tools: List[Tool] = Field(..., description="The tools used by the agent.")
     sources: List[Source] = Field(..., description="The sources used by the agent.")
     tags: List[str] = Field(..., description="The tags associated with the agent.")
@@ -101,7 +117,8 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     base_template_id: Optional[str] = Field(None, description="The base template id of the agent.")
     deployment_id: Optional[str] = Field(None, description="The id of the deployment.")
     entity_id: Optional[str] = Field(None, description="The id of the entity within the template.")
-    identity_ids: List[str] = Field([], description="The ids of the identities associated with this agent.")
+    identity_ids: List[str] = Field([], description="The ids of the identities associated with this agent.", deprecated=True)
+    identities: List[Identity] = Field([], description="The identities associated with this agent.")
 
     # An advanced configuration that makes it so this agent does not remember any previous messages
     message_buffer_autoclear: bool = Field(
@@ -113,8 +130,8 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
         description="If set to True, memory management will move to a background agent thread.",
     )
 
-    multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
-
+    multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages", deprecated=True)
+    managed_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
     # Run metrics
     last_run_completion: Optional[datetime] = Field(None, description="The timestamp when the agent last completed a run.")
     last_run_duration_ms: Optional[int] = Field(None, description="The duration in milliseconds of the agent's last run.")
@@ -256,6 +273,7 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         None,
         description="If set to True, the agent will be hidden.",
     )
+    parallel_tool_calls: Optional[bool] = Field(False, description="If set to True, enables parallel tool calling. Defaults to False.")
 
     @field_validator("name")
     @classmethod
@@ -268,9 +286,16 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
             # don't check if not provided
             return name
 
-        # Regex for allowed characters (alphanumeric, spaces, hyphens, underscores)
-        if not re.match("^[A-Za-z0-9 _-]+$", name):
-            raise ValueError("Name contains invalid characters.")
+        # Regex for allowed characters (Unicode letters, digits, spaces, hyphens, underscores, apostrophes)
+        # \w in Python 3 with re.UNICODE matches Unicode letters, digits, and underscores
+        # We explicitly allow: letters (any language), digits, spaces, hyphens, underscores, apostrophes
+        # We block filesystem-unsafe characters: / \ : * ? " < > |
+        if not re.match(r"^[\w '\-]+$", name, re.UNICODE):
+            raise AgentExportProcessingError(
+                f"Agent name '{name}' contains invalid characters. Only letters (any language), digits, spaces, "
+                f"hyphens, underscores, and apostrophes are allowed. Please avoid filesystem-unsafe characters "
+                f'like: / \\ : * ? " < > |'
+            )
 
         # Further checks can be added here...
         # TODO
@@ -353,6 +378,11 @@ class UpdateAgent(BaseModel):
     embedding: Optional[str] = Field(
         None, description="The embedding configuration handle used by the agent, specified in the format provider/model-name."
     )
+    context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
+    max_tokens: Optional[int] = Field(
+        None,
+        description="The maximum number of tokens to generate, including reasoning step. If not set, the model will use its default value.",
+    )
     reasoning: Optional[bool] = Field(None, description="Whether to enable reasoning for this agent.")
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
     response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
@@ -371,6 +401,7 @@ class UpdateAgent(BaseModel):
         None,
         description="If set to True, the agent will be hidden.",
     )
+    parallel_tool_calls: Optional[bool] = Field(False, description="If set to True, enables parallel tool calling. Defaults to False.")
 
     model_config = ConfigDict(extra="ignore")  # Ignores extra fields
 

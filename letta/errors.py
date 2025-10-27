@@ -19,6 +19,7 @@ class ErrorCode(Enum):
     RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
     TIMEOUT = "TIMEOUT"
     CONFLICT = "CONFLICT"
+    EXPIRED = "EXPIRED"
 
 
 class LettaError(Exception):
@@ -97,6 +98,10 @@ class LettaUserNotFoundError(LettaError):
     """Error raised when a user is not found."""
 
 
+class LettaUnsupportedFileUploadError(LettaError):
+    """Error raised when an unsupported file upload is attempted."""
+
+
 class LettaInvalidArgumentError(LettaError):
     """Error raised when an invalid argument is provided."""
 
@@ -137,8 +142,23 @@ class LettaMCPTimeoutError(LettaMCPError):
         super().__init__(message=message, code=ErrorCode.TIMEOUT, details=details)
 
 
+class LettaServiceUnavailableError(LettaError):
+    """Error raised when a required service is unavailable."""
+
+    def __init__(self, message: str, service_name: Optional[str] = None):
+        details = {"service_name": service_name} if service_name else {}
+        super().__init__(message=message, code=ErrorCode.INTERNAL_SERVER_ERROR, details=details)
+
+
 class LettaUnexpectedStreamCancellationError(LettaError):
     """Error raised when a streaming request is terminated unexpectedly."""
+
+
+class LettaExpiredError(LettaError):
+    """Error raised when a resource has expired."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message, code=ErrorCode.EXPIRED)
 
 
 class LLMError(LettaError):

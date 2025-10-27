@@ -38,7 +38,11 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
         self.request_data = request_data
 
         # Make the blocking LLM request
-        self.response_data = await self.llm_client.request_async(request_data, self.llm_config)
+        try:
+            self.response_data = await self.llm_client.request_async(request_data, self.llm_config)
+        except Exception as e:
+            raise self.llm_client.handle_llm_error(e)
+
         self.llm_request_finish_timestamp_ns = get_utc_timestamp_ns()
 
         # Convert response to chat completion format
@@ -71,10 +75,9 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
             self.content = self.reasoning_content + (self.content or [])
 
         # Extract tool call
-        if self.chat_completions_response.choices[0].message.tool_calls:
-            self.tool_call = self.chat_completions_response.choices[0].message.tool_calls[0]
-        else:
-            self.tool_call = None
+        tool_calls = self.chat_completions_response.choices[0].message.tool_calls or []
+        self.tool_calls = list(tool_calls)
+        self.tool_call = self.tool_calls[0] if self.tool_calls else None
 
         # Extract usage statistics
         self.usage.step_count = 1

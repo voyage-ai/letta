@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from letta.log import get_logger
+
+logger = get_logger(__name__)
+
 import copy
 import json
 import re
 import uuid
-import warnings
 from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
+from letta_client import LettaMessageUnion
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall, Function as OpenAIFunction
 from openai.types.responses import ResponseReasoningItem
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -18,19 +22,22 @@ from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG, RE
 from letta.helpers.datetime_helpers import get_utc_time, is_utc_datetime
 from letta.helpers.json_helpers import json_dumps
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_VERTEX
-from letta.schemas.enums import MessageRole
+from letta.schemas.enums import MessageRole, PrimitiveType
 from letta.schemas.letta_base import OrmMetadataBase
 from letta.schemas.letta_message import (
     ApprovalRequestMessage,
     ApprovalResponseMessage,
+    ApprovalReturn,
     AssistantMessage,
     HiddenReasoningMessage,
     LettaMessage,
+    LettaMessageReturnUnion,
     MessageType,
     ReasoningMessage,
     SystemMessage,
     ToolCall,
     ToolCallMessage,
+    ToolReturn as LettaToolReturn,
     ToolReturnMessage,
     UserMessage,
 )
@@ -68,7 +75,7 @@ def add_inner_thoughts_to_tool_call(
         updated_tool_call.function.arguments = json_dumps(ordered_args)
         return updated_tool_call
     except json.JSONDecodeError as e:
-        warnings.warn(f"Failed to put inner thoughts in kwargs: {e}")
+        logger.warning(f"Failed to put inner thoughts in kwargs: {e}")
         raise e
 
 
@@ -116,9 +123,22 @@ class ApprovalCreate(MessageCreateBase):
     """Input to approve or deny a tool call request"""
 
     type: Literal[MessageCreateType.approval] = Field(default=MessageCreateType.approval, description="The message type to be created.")
-    approve: bool = Field(..., description="Whether the tool has been approved")
-    approval_request_id: str = Field(..., description="The message ID of the approval request")
-    reason: Optional[str] = Field(None, description="An optional explanation for the provided approval status")
+    approvals: Optional[List[LettaMessageReturnUnion]] = Field(default=None, description="The list of approval responses")
+    approve: Optional[bool] = Field(None, description="Whether the tool has been approved", deprecated=True)
+    approval_request_id: Optional[str] = Field(None, description="The message ID of the approval request", deprecated=True)
+    reason: Optional[str] = Field(None, description="An optional explanation for the provided approval status", deprecated=True)
+
+    @model_validator(mode="after")
+    def migrate_deprecated_fields(self):
+        if not self.approvals and self.approve is not None and self.approval_request_id is not None:
+            self.approvals = [
+                ApprovalReturn(
+                    tool_call_id=self.approval_request_id,
+                    approve=self.approve,
+                    reason=self.reason,
+                )
+            ]
+        return self
 
 
 MessageCreateUnion = Union[MessageCreate, ApprovalCreate]
@@ -153,7 +173,7 @@ class MessageUpdate(BaseModel):
 
 
 class BaseMessage(OrmMetadataBase):
-    __id_prefix__ = "message"
+    __id_prefix__ = PrimitiveType.MESSAGE.value
 
 
 class Message(BaseMessage):
@@ -210,6 +230,7 @@ class Message(BaseMessage):
     )
     approve: Optional[bool] = Field(default=None, description="Whether tool call is approved.")
     denial_reason: Optional[str] = Field(default=None, description="The reason the tool call request was denied.")
+    approvals: Optional[List[ApprovalReturn | ToolReturn]] = Field(default=None, description="The list of approvals for this message.")
     # This overrides the optional base orm schema, created_at MUST exist on all messages objects
     created_at: datetime = Field(default_factory=get_utc_time, description="The timestamp when the object was created.")
 
@@ -313,7 +334,7 @@ class Message(BaseMessage):
                     ),
                 )
         elif self.role == MessageRole.tool:
-            messages.extend(self._convert_tool_return_message())
+            messages.append(self._convert_tool_return_message())
         elif self.role == MessageRole.user:
             messages.append(self._convert_user_message())
         elif self.role == MessageRole.system:
@@ -322,20 +343,52 @@ class Message(BaseMessage):
             if self.content:
                 messages.extend(self._convert_reasoning_messages(text_is_assistant_message=text_is_assistant_message))
             if self.tool_calls is not None:
-                tool_calls = self._convert_tool_call_messages()
-                assert len(tool_calls) == 1
-                approval_request_message = ApprovalRequestMessage(**tool_calls[0].model_dump(exclude={"message_type"}))
-                messages.append(approval_request_message)
+                messages.append(self._convert_approval_request_message())
             else:
-                approval_response_message = ApprovalResponseMessage(
-                    id=self.id,
-                    date=self.created_at,
-                    otid=self.otid,
-                    approve=self.approve,
-                    approval_request_id=self.approval_request_id,
-                    reason=self.denial_reason,
-                    run_id=self.run_id,
-                )
+                if self.approvals:
+                    first_approval = [a for a in self.approvals if isinstance(a, ApprovalReturn)]
+
+                    def maybe_convert_tool_return_message(maybe_tool_return):
+                        if isinstance(maybe_tool_return, ToolReturn):
+                            parsed_data = self._parse_tool_response(maybe_tool_return.func_response)
+                            return LettaToolReturn(
+                                tool_call_id=maybe_tool_return.tool_call_id,
+                                status=maybe_tool_return.status,
+                                tool_return=parsed_data["message"],
+                                stdout=maybe_tool_return.stdout,
+                                stderr=maybe_tool_return.stderr,
+                            )
+                        return maybe_tool_return
+
+                    approval_response_message = ApprovalResponseMessage(
+                        id=self.id,
+                        date=self.created_at,
+                        otid=self.otid,
+                        approvals=[maybe_convert_tool_return_message(approval) for approval in self.approvals],
+                        run_id=self.run_id,
+                        # TODO: temporary populate these fields for backwards compatibility
+                        approve=first_approval[0].approve if first_approval else None,
+                        approval_request_id=first_approval[0].tool_call_id if first_approval else None,
+                        reason=first_approval[0].reason if first_approval else None,
+                    )
+                else:
+                    approval_response_message = ApprovalResponseMessage(
+                        id=self.id,
+                        date=self.created_at,
+                        otid=self.otid,
+                        approve=self.approve,
+                        approval_request_id=self.approval_request_id,
+                        reason=self.denial_reason,
+                        approvals=[
+                            # TODO: temporary workaround to populate from legacy fields
+                            ApprovalReturn(
+                                tool_call_id=self.approval_request_id,
+                                approve=self.approve,
+                                reason=self.denial_reason,
+                            )
+                        ],
+                        run_id=self.run_id,
+                    )
                 messages.append(approval_response_message)
         else:
             raise ValueError(f"Unknown role: {self.role}")
@@ -460,7 +513,7 @@ class Message(BaseMessage):
                 )
 
             else:
-                warnings.warn(f"Unrecognized content part in assistant message: {content_part}")
+                logger.warning(f"Unrecognized content part in assistant message: {content_part}")
 
         return messages
 
@@ -592,7 +645,7 @@ class Message(BaseMessage):
 
         return messages
 
-    def _convert_tool_return_message(self) -> List[ToolReturnMessage]:
+    def _convert_tool_return_message(self) -> ToolReturnMessage:
         """Convert tool role message to ToolReturnMessage.
 
         The tool return is packaged as follows:
@@ -603,7 +656,7 @@ class Message(BaseMessage):
             }
 
         Returns:
-            List[ToolReturnMessage]: Converted tool return messages
+            ToolReturnMessage: Converted tool return message
 
         Raises:
             ValueError: If message role is not 'tool', parsing fails, or no valid content exists
@@ -623,27 +676,47 @@ class Message(BaseMessage):
 
         return self._convert_legacy_tool_return()
 
-    def _convert_explicit_tool_returns(self) -> List[ToolReturnMessage]:
-        """Convert explicit tool returns to ToolReturnMessage list."""
-        tool_returns = []
-
-        for index, tool_return in enumerate(self.tool_returns):
+    def _convert_explicit_tool_returns(self) -> ToolReturnMessage:
+        """Convert explicit tool returns to a single ToolReturnMessage."""
+        # build list of all tool return objects
+        all_tool_returns = []
+        for tool_return in self.tool_returns:
             parsed_data = self._parse_tool_response(tool_return.func_response)
 
-            tool_returns.append(
-                self._create_tool_return_message(
-                    message_text=parsed_data["message"],
-                    status=parsed_data["status"],
-                    tool_call_id=tool_return.tool_call_id,
-                    stdout=tool_return.stdout,
-                    stderr=tool_return.stderr,
-                    otid_index=index,
-                )
+            tool_return_obj = LettaToolReturn(
+                tool_return=parsed_data["message"],
+                status=parsed_data["status"],
+                tool_call_id=tool_return.tool_call_id,
+                stdout=tool_return.stdout,
+                stderr=tool_return.stderr,
             )
+            all_tool_returns.append(tool_return_obj)
 
-        return tool_returns
+        if not all_tool_returns:
+            # this should not happen if tool_returns is non-empty, but handle gracefully
+            raise ValueError("No tool returns to convert")
 
-    def _convert_legacy_tool_return(self) -> List[ToolReturnMessage]:
+        first_tool_return = all_tool_returns[0]
+
+        return ToolReturnMessage(
+            id=self.id,
+            date=self.created_at,
+            # deprecated top-level fields populated from first tool return
+            tool_return=first_tool_return.tool_return,
+            status=first_tool_return.status,
+            tool_call_id=first_tool_return.tool_call_id,
+            stdout=first_tool_return.stdout,
+            stderr=first_tool_return.stderr,
+            tool_returns=all_tool_returns,
+            name=self.name,
+            otid=Message.generate_otid_from_id(self.id, 0),
+            sender_id=self.sender_id,
+            step_id=self.step_id,
+            is_err=self.is_err,
+            run_id=self.run_id,
+        )
+
+    def _convert_legacy_tool_return(self) -> ToolReturnMessage:
         """Convert legacy single text content to ToolReturnMessage."""
         if not self._has_single_text_content():
             raise ValueError(f"No valid tool returns to convert: {self}")
@@ -651,16 +724,14 @@ class Message(BaseMessage):
         text_content = self.content[0].text
         parsed_data = self._parse_tool_response(text_content)
 
-        return [
-            self._create_tool_return_message(
-                message_text=parsed_data["message"],
-                status=parsed_data["status"],
-                tool_call_id=self.tool_call_id,
-                stdout=None,
-                stderr=None,
-                otid_index=0,
-            )
-        ]
+        return self._create_tool_return_message(
+            message_text=parsed_data["message"],
+            status=parsed_data["status"],
+            tool_call_id=self.tool_call_id,
+            stdout=None,
+            stderr=None,
+            otid_index=0,
+        )
 
     def _has_single_text_content(self) -> bool:
         """Check if message has exactly one text content item."""
@@ -709,9 +780,7 @@ class Message(BaseMessage):
         Returns:
             Configured ToolReturnMessage instance
         """
-        from letta.schemas.letta_message import ToolReturn as ToolReturnSchema
-
-        tool_return_obj = ToolReturnSchema(
+        tool_return_obj = LettaToolReturn(
             tool_return=message_text,
             status=status,
             tool_call_id=tool_call_id,
@@ -745,6 +814,28 @@ class Message(BaseMessage):
             return "error"
         else:
             raise ValueError(f"Invalid status: {status}")
+
+    def _convert_approval_request_message(self) -> ApprovalRequestMessage:
+        """Convert approval request message to ApprovalRequestMessage"""
+
+        def _convert_tool_call(tool_call):
+            return ToolCall(
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+                tool_call_id=tool_call.id,
+            )
+
+        return ApprovalRequestMessage(
+            id=self.id,
+            date=self.created_at,
+            otid=self.otid,
+            sender_id=self.sender_id,
+            step_id=self.step_id,
+            run_id=self.run_id,
+            tool_call=_convert_tool_call(self.tool_calls[0]),  # backwards compatibility
+            tool_calls=[_convert_tool_call(tc) for tc in self.tool_calls],
+            name=self.name,
+        )
 
     def _convert_user_message(self) -> UserMessage:
         """Convert user role message to UserMessage"""
@@ -815,6 +906,12 @@ class Message(BaseMessage):
         content: List[LettaMessageContentUnion] = (
             [TextContent(text=openai_message_dict["content"])] if openai_message_dict["content"] else []
         )
+
+        # This is really hacky and this interface is poorly designed, we should auto derive tool_returns instead of passing it in
+        if not tool_returns:
+            tool_returns = []
+            if "tool_returns" in openai_message_dict:
+                tool_returns = [ToolReturn(**tr) for tr in openai_message_dict["tool_returns"]]
 
         # TODO(caren) bad assumption here that "reasoning_content" always comes before "redacted_reasoning_content"
         if "reasoning_content" in openai_message_dict and openai_message_dict["reasoning_content"]:
@@ -1099,7 +1196,7 @@ class Message(BaseMessage):
             if bool(re.match(r"^[^\s<|\\/>]+$", self.name)):
                 openai_message["name"] = self.name
             else:
-                warnings.warn(f"Using OpenAI with invalid 'name' field (name={self.name} role={self.role}).")
+                logger.warning(f"Using OpenAI with invalid 'name' field (name={self.name} role={self.role}).")
 
         if parse_content_parts and self.content is not None:
             for content in self.content:
@@ -1166,7 +1263,7 @@ class Message(BaseMessage):
                 if bool(re.match(r"^[^\s<|\\/>]+$", self.name)):
                     user_dict["name"] = self.name
                 else:
-                    warnings.warn(f"Using OpenAI with invalid 'name' field (name={self.name} role={self.role}).")
+                    logger.warning(f"Using OpenAI with invalid 'name' field (name={self.name} role={self.role}).")
 
             message_dicts.append(user_dict)
 
@@ -1414,18 +1511,38 @@ class Message(BaseMessage):
 
         elif self.role == "tool":
             # NOTE: Anthropic uses role "user" for "tool" responses
-            assert self.tool_call_id is not None, vars(self)
-            anthropic_message = {
-                "role": "user",  # NOTE: diff
-                "content": [
-                    # TODO support error types etc
+            content = []
+            for tool_return in self.tool_returns:
+                if not tool_return.tool_call_id:
+                    raise TypeError("Anthropic API requires tool_use_id to be set.")
+                content.append(
                     {
                         "type": "tool_result",
-                        "tool_use_id": self.tool_call_id,
-                        "content": text_content,
+                        "tool_use_id": tool_return.tool_call_id,
+                        "content": tool_return.func_response,
                     }
-                ],
-            }
+                )
+            if content:
+                anthropic_message = {
+                    "role": "user",
+                    "content": content,
+                }
+            else:
+                if not self.tool_call_id:
+                    raise TypeError("Anthropic API requires tool_use_id to be set.")
+
+                # This is for legacy reasons
+                anthropic_message = {
+                    "role": "user",  # NOTE: diff
+                    "content": [
+                        # TODO support error types etc
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": self.tool_call_id,
+                            "content": text_content,
+                        }
+                    ],
+                }
 
         else:
             raise ValueError(self.role)
@@ -1483,7 +1600,7 @@ class Message(BaseMessage):
             text_content = None
 
         if self.role != "tool" and self.name is not None:
-            warnings.warn(f"Using Google AI with non-null 'name' field (name={self.name} role={self.role}), not yet supported.")
+            logger.warning(f"Using Google AI with non-null 'name' field (name={self.name} role={self.role}), not yet supported.")
 
         if self.role == "system":
             # NOTE: Gemini API doesn't have a 'system' role, use 'user' instead
@@ -1603,7 +1720,7 @@ class Message(BaseMessage):
             assert self.tool_call_id is not None, vars(self)
 
             if self.name is None:
-                warnings.warn("Couldn't find function name on tool call, defaulting to tool ID instead.")
+                logger.warning("Couldn't find function name on tool call, defaulting to tool ID instead.")
                 function_name = self.tool_call_id
             else:
                 function_name = self.name
@@ -1636,7 +1753,7 @@ class Message(BaseMessage):
         if "parts" not in google_ai_message or not google_ai_message["parts"]:
             # If parts is empty, add a default text part
             google_ai_message["parts"] = [{"text": "empty message"}]
-            warnings.warn(
+            logger.warning(
                 f"Empty 'parts' detected in message with role '{self.role}'. Added default empty text part. Full message:\n{vars(self)}"
             )
 
@@ -1697,6 +1814,9 @@ class Message(BaseMessage):
         # Filter last message if it is a lone approval request without a response - this only occurs for token counting
         if messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
             messages.remove(messages[-1])
+            # Also filter pending tool call message if this turn invoked parallel tool calling
+            if messages and messages[-1].role == "assistant" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
+                messages.remove(messages[-1])
 
         # Filter last message if it is a lone reasoning message without assistant message or tool call
         if (
@@ -1706,6 +1826,28 @@ class Message(BaseMessage):
         ):
             messages.remove(messages[-1])
 
+        # Collapse adjacent tool call and approval messages
+        messages = Message.collapse_tool_call_messages_for_llm_api(messages)
+
+        return messages
+
+    @staticmethod
+    def collapse_tool_call_messages_for_llm_api(
+        messages: List[Message],
+    ) -> List[Message]:
+        adjacent_tool_call_approval_messages = []
+        for i in range(len(messages) - 1):
+            if (
+                messages[i].role == MessageRole.assistant
+                and messages[i].tool_calls is not None
+                and messages[i + 1].role == MessageRole.approval
+                and messages[i + 1].tool_calls is not None
+            ):
+                adjacent_tool_call_approval_messages.append(i)
+        for i in reversed(adjacent_tool_call_approval_messages):
+            messages[i].content = messages[i].content + messages[i + 1].content
+            messages[i].tool_calls = messages[i].tool_calls + messages[i + 1].tool_calls
+            messages.remove(messages[i + 1])
         return messages
 
     @staticmethod
@@ -1713,6 +1855,9 @@ class Message(BaseMessage):
         """
         Convert message id to bits and change the list bit to the index
         """
+        if index == -1:
+            return message_id
+
         if not 0 <= index < 128:
             raise ValueError("Index must be between 0 and 127")
 
