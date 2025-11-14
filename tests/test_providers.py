@@ -479,3 +479,24 @@ async def test_voyageai_real_api():
     for model in embedding_models:
         assert model.embedding_endpoint_type == "voyageai"
         assert model.handle.startswith("voyageai/")
+
+def test_codex_default_reasoning_effort():
+    """Test that gpt-5-codex defaults to 'medium' reasoning effort, not 'minimal'."""
+    # Test with apply_reasoning_setting_to_config for v2 agent
+    config = LLMConfig(
+        model="gpt-5-codex",
+        model_endpoint_type="openai",
+        context_window=272000,
+    )
+
+    # For v2 agent with reasoning=True
+    new_config = LLMConfig.apply_reasoning_setting_to_config(config, reasoning=True, agent_type=AgentType.memgpt_v2_agent)
+    assert new_config.reasoning_effort == "medium", "gpt-5-codex should default to 'medium', not 'minimal'"
+
+    # For v2 agent with reasoning=False (still can't disable for reasoning models)
+    new_config = LLMConfig.apply_reasoning_setting_to_config(config, reasoning=False, agent_type=AgentType.memgpt_v2_agent)
+    assert new_config.reasoning_effort == "medium", "gpt-5-codex should default to 'medium', not 'minimal'"
+
+    # For v1 agent with reasoning=True
+    new_config = LLMConfig.apply_reasoning_setting_to_config(config, reasoning=True, agent_type=AgentType.letta_v1_agent)
+    assert new_config.reasoning_effort == "medium", "gpt-5-codex should default to 'medium', not 'minimal'"
