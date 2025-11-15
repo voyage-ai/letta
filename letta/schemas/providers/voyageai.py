@@ -16,7 +16,6 @@ class VoyageAIProvider(Provider):
 
     provider_type: Literal[ProviderType.voyageai] = Field(ProviderType.voyageai, description="The type of the provider.")
     provider_category: ProviderCategory = Field(ProviderCategory.base, description="The category of the provider (base or byok)")
-    name: str = "voyageai"
     api_key: str = Field(..., description="API key for the VoyageAI API.")
     base_url: str = "https://api.voyageai.com/v1"
 
@@ -66,3 +65,6 @@ class VoyageAIProvider(Provider):
             )
             for model in voyageai_model_config
         ]
+
+    async def list_embedding_models_async(self) -> List[EmbeddingConfig]:
+        return self.list_embedding_models()
