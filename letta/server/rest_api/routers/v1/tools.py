@@ -7,8 +7,7 @@ from httpx import ConnectError, HTTPStatusError
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
-from letta.constants import MAX_TOOL_NAME_LENGTH
-from letta.constants import DEFAULT_GENERATE_TOOL_MODEL_HANDLE
+from letta.constants import DEFAULT_GENERATE_TOOL_MODEL_HANDLE, MAX_TOOL_NAME_LENGTH
 from letta.errors import (
     LettaInvalidArgumentError,
     LettaInvalidMCPSchemaError,
@@ -283,7 +282,10 @@ async def create_tool(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     tool = Tool(**request.model_dump(exclude_unset=True))
-    return await server.tool_manager.create_or_update_tool_async(pydantic_tool=tool, actor=actor)
+    modal_sandbox_enabled = bool(headers.experimental_params.modal_sandbox) if headers.experimental_params else False
+    return await server.tool_manager.create_or_update_tool_async(
+        pydantic_tool=tool, actor=actor, modal_sandbox_enabled=modal_sandbox_enabled
+    )
 
 
 @router.put("/", response_model=Tool, operation_id="upsert_tool")
@@ -296,7 +298,10 @@ async def upsert_tool(
     Create or update a tool
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    tool = await server.tool_manager.create_or_update_tool_async(pydantic_tool=Tool(**request.model_dump(exclude_unset=True)), actor=actor)
+    modal_sandbox_enabled = bool(headers.experimental_params.modal_sandbox) if headers.experimental_params else False
+    tool = await server.tool_manager.create_or_update_tool_async(
+        pydantic_tool=Tool(**request.model_dump(exclude_unset=True)), actor=actor, modal_sandbox_enabled=modal_sandbox_enabled
+    )
     return tool
 
 
@@ -311,7 +316,10 @@ async def modify_tool(
     Update an existing tool
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    tool = await server.tool_manager.update_tool_by_id_async(tool_id=tool_id, tool_update=request, actor=actor)
+    modal_sandbox_enabled = bool(headers.experimental_params.modal_sandbox) if headers.experimental_params else False
+    tool = await server.tool_manager.update_tool_by_id_async(
+        tool_id=tool_id, tool_update=request, actor=actor, modal_sandbox_enabled=modal_sandbox_enabled
+    )
     return tool
 
 
@@ -365,7 +373,7 @@ async def list_mcp_servers(
     Get a list of all configured MCP servers
     """
     if tool_settings.mcp_read_from_config:
-        return server.get_mcp_servers()
+        return await server.get_mcp_servers()
     else:
         actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
         mcp_servers = await server.mcp_manager.list_mcp_servers(actor=actor)
@@ -541,7 +549,7 @@ async def delete_mcp_server_from_config(
     """
     if tool_settings.mcp_read_from_config:
         # write to config file
-        return server.delete_mcp_server_from_config(server_name=mcp_server_name)
+        return await server.delete_mcp_server_from_config(server_name=mcp_server_name)
     else:
         # log to DB
         actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import List, Optional
 
 import openai
@@ -70,6 +71,14 @@ def does_not_support_minimal_reasoning(model: str) -> bool:
     Currently, models that contain codex don't support minimal reasoning.
     """
     return "codex" in model.lower()
+
+
+def supports_none_reasoning_effort(model: str) -> bool:
+    """Check if the model supports 'none' reasoning effort.
+
+    Currently, only GPT-5.1 models support the 'none' reasoning effort level.
+    """
+    return model.startswith("gpt-5.1")
 
 
 def is_openai_5_model(model: str) -> bool:
@@ -337,7 +346,8 @@ class OpenAIClient(LLMClientBase):
             data.text = ResponseTextConfigParam(verbosity=llm_config.verbosity)
 
         # Add reasoning effort control for reasoning models
-        if is_openai_reasoning_model(model) and llm_config.reasoning_effort:
+        # Only set reasoning if effort is not "none" (GPT-5.1 uses "none" to disable reasoning)
+        if is_openai_reasoning_model(model) and llm_config.reasoning_effort and llm_config.reasoning_effort != "none":
             # data.reasoning_effort = llm_config.reasoning_effort
             data.reasoning = Reasoning(
                 effort=llm_config.reasoning_effort,
@@ -481,7 +491,8 @@ class OpenAIClient(LLMClientBase):
             data.verbosity = llm_config.verbosity
 
         # Add reasoning effort control for reasoning models
-        if is_openai_reasoning_model(model) and llm_config.reasoning_effort:
+        # Only set reasoning_effort if it's not "none" (GPT-5.1 uses "none" to disable reasoning)
+        if is_openai_reasoning_model(model) and llm_config.reasoning_effort and llm_config.reasoning_effort != "none":
             data.reasoning_effort = llm_config.reasoning_effort
 
         if llm_config.frequency_penalty is not None:
@@ -738,7 +749,8 @@ class OpenAIClient(LLMClientBase):
         if not inputs:
             return []
 
-        logger.info(f"request_embeddings called with {len(inputs)} inputs, model={embedding_config.embedding_model}")
+        request_start = time.time()
+        logger.info(f"DIAGNOSTIC: request_embeddings called with {len(inputs)} inputs, model={embedding_config.embedding_model}")
 
         # Validate inputs - OpenAI rejects empty strings or non-string values
         # See: https://community.openai.com/t/embedding-api-change-input-is-invalid/707490/7
@@ -779,8 +791,12 @@ class OpenAIClient(LLMClientBase):
             task_metadata = []
 
             for start_idx, chunk_inputs, current_batch_size in chunks_to_process:
+                if not chunk_inputs:
+                    logger.warning(f"Skipping empty chunk at start_idx={start_idx}")
+                    continue
+
                 logger.info(
-                    f"Creating embedding task: start_idx={start_idx}, batch_size={len(chunk_inputs)}, "
+                    f"DIAGNOSTIC: Creating embedding task: start_idx={start_idx}, batch_size={len(chunk_inputs)}, "
                     f"first_input_len={len(chunk_inputs[0]) if chunk_inputs else 0}, "
                     f"model={embedding_config.embedding_model}"
                 )
@@ -788,7 +804,19 @@ class OpenAIClient(LLMClientBase):
                 tasks.append(task)
                 task_metadata.append((start_idx, chunk_inputs, current_batch_size))
 
+            if not tasks:
+                logger.warning("All chunks were empty, skipping embedding request")
+                break
+
+            gather_start = time.time()
+            logger.info(f"DIAGNOSTIC: Awaiting {len(tasks)} embedding API calls...")
             task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            gather_duration = time.time() - gather_start
+
+            if gather_duration > 1.0:
+                logger.warning(f"DIAGNOSTIC: SLOW embedding API gather took {gather_duration:.2f}s for {len(tasks)} tasks")
+            else:
+                logger.info(f"DIAGNOSTIC: Embedding API gather completed in {gather_duration:.2f}s")
 
             failed_chunks = []
             for (start_idx, chunk_inputs, current_batch_size), result in zip(task_metadata, task_results):
@@ -801,21 +829,27 @@ class OpenAIClient(LLMClientBase):
                             f"Embeddings request failed for batch starting at {start_idx} with size {current_size}. "
                             f"Reducing batch size from {current_batch_size} to {new_batch_size} and retrying."
                         )
-                        mid = len(chunk_inputs) // 2
-                        failed_chunks.append((start_idx, chunk_inputs[:mid], new_batch_size))
-                        failed_chunks.append((start_idx + mid, chunk_inputs[mid:], new_batch_size))
+                        mid = max(1, len(chunk_inputs) // 2)
+                        if chunk_inputs[:mid]:
+                            failed_chunks.append((start_idx, chunk_inputs[:mid], new_batch_size))
+                        if chunk_inputs[mid:]:
+                            failed_chunks.append((start_idx + mid, chunk_inputs[mid:], new_batch_size))
                     elif current_size > min_chunk_size:
                         logger.warning(
                             f"Embeddings request failed for single item at {start_idx} with size {current_size}. "
                             f"Splitting individual text content and retrying."
                         )
-                        mid = len(chunk_inputs) // 2
-                        failed_chunks.append((start_idx, chunk_inputs[:mid], 1))
-                        failed_chunks.append((start_idx + mid, chunk_inputs[mid:], 1))
+                        mid = max(1, len(chunk_inputs) // 2)
+                        if chunk_inputs[:mid]:
+                            failed_chunks.append((start_idx, chunk_inputs[:mid], 1))
+                        if chunk_inputs[mid:]:
+                            failed_chunks.append((start_idx + mid, chunk_inputs[mid:], 1))
                     else:
+                        chunk_preview = str(chunk_inputs)[:500] if chunk_inputs else "None"
                         logger.error(
                             f"Failed to get embeddings for chunk starting at {start_idx} even with batch_size=1 "
-                            f"and minimum chunk size {min_chunk_size}. Error: {result}"
+                            f"and minimum chunk size {min_chunk_size}. Error: {result}. "
+                            f"Chunk preview (first 500 chars): {chunk_preview}"
                         )
                         raise result
                 else:
@@ -824,6 +858,14 @@ class OpenAIClient(LLMClientBase):
                         results[start_idx + i] = embedding
 
             chunks_to_process = failed_chunks
+
+        total_duration = time.time() - request_start
+        if total_duration > 2.0:
+            logger.error(f"DIAGNOSTIC: BLOCKING DETECTED - request_embeddings took {total_duration:.2f}s for {len(inputs)} inputs")
+        elif total_duration > 1.0:
+            logger.warning(f"DIAGNOSTIC: Slow request_embeddings took {total_duration:.2f}s for {len(inputs)} inputs")
+        else:
+            logger.info(f"DIAGNOSTIC: request_embeddings completed in {total_duration:.2f}s")
 
         return results
 

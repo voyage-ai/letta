@@ -1,5 +1,6 @@
 """Turbopuffer utilities for archival memory storage."""
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional, Tuple
@@ -12,6 +13,10 @@ from letta.schemas.passage import Passage as PydanticPassage
 from letta.settings import model_settings, settings
 
 logger = logging.getLogger(__name__)
+
+# Global semaphore for Turbopuffer operations to prevent overwhelming the service
+# This is separate from embedding semaphore since Turbopuffer can handle more concurrency
+_GLOBAL_TURBOPUFFER_SEMAPHORE = asyncio.Semaphore(5)
 
 
 def should_use_tpuf() -> bool:
@@ -205,17 +210,19 @@ class TurbopufferClient:
         }
 
         try:
-            # Use AsyncTurbopuffer as a context manager for proper resource cleanup
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # turbopuffer recommends column-based writes for performance
-                await namespace.write(
-                    upsert_columns=upsert_columns,
-                    distance_metric="cosine_distance",
-                    schema={"text": {"type": "string", "full_text_search": True}},
-                )
-                logger.info(f"Successfully inserted {len(ids)} passages to Turbopuffer for archive {archive_id}")
-                return passages
+            # use global semaphore to limit concurrent Turbopuffer writes
+            async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
+                # Use AsyncTurbopuffer as a context manager for proper resource cleanup
+                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
+                    namespace = client.namespace(namespace_name)
+                    # turbopuffer recommends column-based writes for performance
+                    await namespace.write(
+                        upsert_columns=upsert_columns,
+                        distance_metric="cosine_distance",
+                        schema={"text": {"type": "string", "full_text_search": True}},
+                    )
+                    logger.info(f"Successfully inserted {len(ids)} passages to Turbopuffer for archive {archive_id}")
+                    return passages
 
         except Exception as e:
             logger.error(f"Failed to insert passages to Turbopuffer: {e}")
@@ -333,17 +340,19 @@ class TurbopufferClient:
             upsert_columns["template_id"] = template_ids
 
         try:
-            # Use AsyncTurbopuffer as a context manager for proper resource cleanup
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # turbopuffer recommends column-based writes for performance
-                await namespace.write(
-                    upsert_columns=upsert_columns,
-                    distance_metric="cosine_distance",
-                    schema={"text": {"type": "string", "full_text_search": True}},
-                )
-                logger.info(f"Successfully inserted {len(ids)} messages to Turbopuffer for agent {agent_id}")
-                return True
+            # use global semaphore to limit concurrent Turbopuffer writes
+            async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
+                # Use AsyncTurbopuffer as a context manager for proper resource cleanup
+                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
+                    namespace = client.namespace(namespace_name)
+                    # turbopuffer recommends column-based writes for performance
+                    await namespace.write(
+                        upsert_columns=upsert_columns,
+                        distance_metric="cosine_distance",
+                        schema={"text": {"type": "string", "full_text_search": True}},
+                    )
+                    logger.info(f"Successfully inserted {len(ids)} messages to Turbopuffer for agent {agent_id}")
+                    return True
 
         except Exception as e:
             logger.error(f"Failed to insert messages to Turbopuffer: {e}")
@@ -758,6 +767,7 @@ class TurbopufferClient:
         search_mode: str = "hybrid",  # "vector", "fts", "hybrid"
         top_k: int = 10,
         roles: Optional[List[MessageRole]] = None,
+        agent_id: Optional[str] = None,
         project_id: Optional[str] = None,
         template_id: Optional[str] = None,
         vector_weight: float = 0.5,
@@ -774,6 +784,7 @@ class TurbopufferClient:
             search_mode: Search mode - "vector", "fts", or "hybrid" (default: "hybrid")
             top_k: Number of results to return
             roles: Optional list of message roles to filter by
+            agent_id: Optional agent ID to filter messages by
             project_id: Optional project ID to filter messages by
             template_id: Optional template ID to filter messages by
             vector_weight: Weight for vector search results in hybrid mode (default: 0.5)
@@ -805,6 +816,10 @@ class TurbopufferClient:
                 all_filters.append(("role", "Eq", role_values[0]))
             else:
                 all_filters.append(("role", "In", role_values))
+
+        # agent filter
+        if agent_id:
+            all_filters.append(("agent_id", "Eq", agent_id))
 
         # project filter
         if project_id:
@@ -1253,17 +1268,19 @@ class TurbopufferClient:
         }
 
         try:
-            # use AsyncTurbopuffer as a context manager for proper resource cleanup
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # turbopuffer recommends column-based writes for performance
-                await namespace.write(
-                    upsert_columns=upsert_columns,
-                    distance_metric="cosine_distance",
-                    schema={"text": {"type": "string", "full_text_search": True}},
-                )
-                logger.info(f"Successfully inserted {len(ids)} file passages to Turbopuffer for source {source_id}, file {file_id}")
-                return passages
+            # use global semaphore to limit concurrent Turbopuffer writes
+            async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
+                # use AsyncTurbopuffer as a context manager for proper resource cleanup
+                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
+                    namespace = client.namespace(namespace_name)
+                    # turbopuffer recommends column-based writes for performance
+                    await namespace.write(
+                        upsert_columns=upsert_columns,
+                        distance_metric="cosine_distance",
+                        schema={"text": {"type": "string", "full_text_search": True}},
+                    )
+                    logger.info(f"Successfully inserted {len(ids)} file passages to Turbopuffer for source {source_id}, file {file_id}")
+                    return passages
 
         except Exception as e:
             logger.error(f"Failed to insert file passages to Turbopuffer: {e}")

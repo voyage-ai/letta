@@ -101,6 +101,7 @@ async def list_agents(
             "Using this can optimize performance by reducing unnecessary joins."
             "This is a legacy parameter, and no longer supported after 1.0.0 SDK versions."
         ),
+        deprecated=True,
     ),
     include: List[AgentRelationships] = Query(
         [],
@@ -334,6 +335,25 @@ async def import_agent(
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
     x_override_embedding_model: str | None = Header(None, alias="x-override-embedding-model"),
+    # New fields (all optional)
+    override_existing_tools: bool = Form(
+        True,
+        description="If set to True, existing tools can get their source code overwritten by the uploaded tool definitions. Note that Letta core tools can never be updated externally.",
+    ),
+    strip_messages: bool = Form(
+        False,
+        description="If set to True, strips all messages from the agent before importing.",
+    ),
+    secrets: Optional[str] = Form(None, description="Secrets as a JSON string to pass to the agent for tool execution."),
+    name: Optional[str] = Form(
+        None,
+        description="If provided, overrides the agent name with this value.",
+    ),
+    embedding: Optional[str] = Form(
+        None,
+        description="Embedding handle to override with.",
+    ),
+    # Deprecated fields (maintain backward compatibility)
     append_copy_suffix: bool = Form(
         True,
         description='If set to True, appends "_copy" to the end of the agent name.',
@@ -341,23 +361,21 @@ async def import_agent(
     ),
     override_name: Optional[str] = Form(
         None,
-        description="If provided, overrides the agent name with this value.",
-    ),
-    override_existing_tools: bool = Form(
-        True,
-        description="If set to True, existing tools can get their source code overwritten by the uploaded tool definitions. Note that Letta core tools can never be updated externally.",
+        description="If provided, overrides the agent name with this value. Use 'name' instead.",
+        deprecated=True,
     ),
     override_embedding_handle: Optional[str] = Form(
         None,
-        description="Override import with specific embedding handle.",
+        description="Override import with specific embedding handle. Use 'embedding' instead.",
+        deprecated=True,
     ),
-    project_id: str | None = Form(None, description="The project ID to associate the uploaded agent with."),
-    strip_messages: bool = Form(
-        False,
-        description="If set to True, strips all messages from the agent before importing.",
+    project_id: str | None = Form(
+        None, description="The project ID to associate the uploaded agent with. This is now passed via headers.", deprecated=True
     ),
     env_vars_json: Optional[str] = Form(
-        None, description="Environment variables as a JSON string to pass to the agent for tool execution."
+        None,
+        description="Environment variables as a JSON string to pass to the agent for tool execution. Use 'secrets' instead.",
+        deprecated=True,
     ),
 ):
     """
@@ -374,19 +392,25 @@ async def import_agent(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Corrupted agent file format.")
 
-    # Parse env_vars_json if provided
+    # Handle backward compatibility: prefer new field names over deprecated ones
+    final_name = name or override_name
+    final_embedding_handle = embedding or override_embedding_handle or x_override_embedding_model
+
+    # Parse secrets (new) or env_vars_json (deprecated)
     env_vars = None
-    if env_vars_json:
+    secrets_json = secrets or env_vars_json
+    if secrets_json:
         try:
-            env_vars = json.loads(env_vars_json)
+            env_vars = json.loads(secrets_json)
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="env_vars_json must be a valid JSON string")
+            raise HTTPException(status_code=400, detail="secrets must be a valid JSON string")
 
         if not isinstance(env_vars, dict):
-            raise HTTPException(status_code=400, detail="env_vars_json must be a valid JSON string")
+            raise HTTPException(status_code=400, detail="secrets must be a valid JSON string")
 
-    # Prioritize header over form data for override_embedding_handle
-    final_override_embedding_handle = x_override_embedding_model or override_embedding_handle
+    # Get project_id from headers (preferred) or fall back to form data for backward compatibility
+    # In cloud environments, project_id should be passed via headers
+    final_project_id = headers.project_id or project_id
 
     # Check if the JSON is AgentFileSchema or AgentSchema
     # TODO: This is kind of hacky, but should work as long as dont' change the schema
@@ -397,12 +421,12 @@ async def import_agent(
             server=server,
             actor=actor,
             append_copy_suffix=append_copy_suffix,
-            override_name=override_name,
+            override_name=final_name,
             override_existing_tools=override_existing_tools,
-            project_id=project_id,
+            project_id=final_project_id,
             strip_messages=strip_messages,
             env_vars=env_vars,
-            override_embedding_handle=final_override_embedding_handle,
+            override_embedding_handle=final_embedding_handle,
         )
     else:
         # This is a legacy AgentSchema
@@ -449,8 +473,6 @@ async def create_agent(
     Create an agent.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    if headers.experimental_params.letta_v1_agent and agent.agent_type == AgentType.memgpt_v2_agent:
-        agent.agent_type = AgentType.letta_v1_agent
     return await server.create_agent_async(agent, actor=actor)
 
 
@@ -599,7 +621,7 @@ async def attach_source(
     return agent_state
 
 
-@router.patch("/{agent_id}/folders/attach/{folder_id}", response_model=AgentState, operation_id="attach_folder_to_agent")
+@router.patch("/{agent_id}/folders/attach/{folder_id}", response_model=Optional[AgentState], operation_id="attach_folder_to_agent")
 async def attach_folder_to_agent(
     folder_id: SourceId,
     agent_id: AgentId,
@@ -623,6 +645,8 @@ async def attach_folder_to_agent(
         source = await server.source_manager.get_source_by_id(source_id=folder_id)
         safe_create_task(server.sleeptime_document_ingest_async(agent_state, source, actor), label="sleeptime_document_ingest_async")
 
+    if is_1_0_sdk_version(headers):
+        return None
     return agent_state
 
 
@@ -653,10 +677,11 @@ async def detach_source(
             await server.block_manager.delete_block_async(block.id, actor)
         except:
             pass
+
     return agent_state
 
 
-@router.patch("/{agent_id}/folders/detach/{folder_id}", response_model=AgentState, operation_id="detach_folder_from_agent")
+@router.patch("/{agent_id}/folders/detach/{folder_id}", response_model=Optional[AgentState], operation_id="detach_folder_from_agent")
 async def detach_folder_from_agent(
     folder_id: SourceId,
     agent_id: AgentId,
@@ -683,6 +708,9 @@ async def detach_folder_from_agent(
             await server.block_manager.delete_block_async(block.id, actor)
         except:
             pass
+
+    if is_1_0_sdk_version(headers):
+        return None
     return agent_state
 
 
@@ -788,6 +816,7 @@ async def retrieve_agent(
             "Using this can optimize performance by reducing unnecessary joins."
             "This is a legacy parameter, and no longer supported after 1.0.0 SDK versions."
         ),
+        deprecated=True,
     ),
     include: List[AgentRelationships] = Query(
         [],
@@ -1569,6 +1598,7 @@ async def cancel_message(
                 statuses=[RunStatus.created, RunStatus.running],
                 ascending=False,
                 agent_id=agent_id,  # NOTE: this will override agent_ids if provided
+                limit=100,  # Limit to 10 most recent active runs for cancellation
             )
             run_ids = [run.id for run in run_ids]
         else:
@@ -1613,6 +1643,7 @@ async def search_messages(
         query_text=request.query,
         search_mode=request.search_mode,
         roles=request.roles,
+        agent_id=request.agent_id,
         project_id=request.project_id,
         template_id=request.template_id,
         limit=request.limit,
@@ -1799,7 +1830,11 @@ async def send_message_async(
         agent_state = await server.agent_manager.get_agent_by_id_async(
             agent_id, actor, include_relationships=["memory", "multi_agent_group", "sources", "tool_exec_environment_variables", "tools"]
         )
-        if agent_state.multi_agent_group is None and agent_state.agent_type != AgentType.letta_v1_agent:
+        # Allow V1 agents only if the message async flag is enabled
+        is_v1_message_async_enabled = (
+            agent_state.agent_type == AgentType.letta_v1_agent and headers.experimental_params.letta_v1_agent_message_async
+        )
+        if agent_state.multi_agent_group is None and (agent_state.agent_type != AgentType.letta_v1_agent or is_v1_message_async_enabled):
             lettuce_client = await LettuceClient.create()
             run_id_from_lettuce = await lettuce_client.step(
                 agent_state=agent_state,
@@ -1870,7 +1905,7 @@ class ResetMessagesRequest(BaseModel):
     )
 
 
-@router.patch("/{agent_id}/reset-messages", response_model=AgentState, operation_id="reset_messages")
+@router.patch("/{agent_id}/reset-messages", response_model=Optional[AgentState], operation_id="reset_messages")
 async def reset_messages(
     agent_id: AgentId,
     request: ResetMessagesRequest = Body(...),
@@ -1880,7 +1915,10 @@ async def reset_messages(
     """Resets the messages for an agent"""
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     return await server.agent_manager.reset_messages_async(
-        agent_id=agent_id, actor=actor, add_default_initial_messages=request.add_default_initial_messages
+        agent_id=agent_id,
+        actor=actor,
+        add_default_initial_messages=request.add_default_initial_messages,
+        needs_agent_state=not is_1_0_sdk_version(headers),
     )
 
 
@@ -1904,7 +1942,7 @@ async def list_groups_for_agent(
 ):
     """Lists the groups for an agent."""
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    logger.info("in list agents with manager_type", manager_type)
+    logger.info("in list agents with manager_type: %s", manager_type)
     return await server.agent_manager.list_groups_async(
         agent_id=agent_id,
         manager_type=manager_type,

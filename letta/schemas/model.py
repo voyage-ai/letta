@@ -65,7 +65,7 @@ class Model(LLMConfig, ModelBase):
         description="Deprecated: Whether or not the model should use extended thinking if it is a 'reasoning' style model.",
         deprecated=True,
     )
-    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = Field(
         None, description="Deprecated: The reasoning effort to use when generating text reasoning models.", deprecated=True
     )
     max_reasoning_tokens: int = Field(0, description="Deprecated: Configurable thinking budget for extended thinking.", deprecated=True)
@@ -112,6 +112,7 @@ class Model(LLMConfig, ModelBase):
             enable_reasoner=llm_config.enable_reasoner,
             reasoning_effort=llm_config.reasoning_effort,
             max_reasoning_tokens=llm_config.max_reasoning_tokens,
+            effort=llm_config.effort,
             frequency_penalty=llm_config.frequency_penalty,
             compatibility_type=llm_config.compatibility_type,
             verbosity=llm_config.verbosity,
@@ -209,7 +210,7 @@ class ModelSettings(BaseModel):
 
 
 class OpenAIReasoning(BaseModel):
-    reasoning_effort: Literal["minimal", "low", "medium", "high"] = Field(
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] = Field(
         "minimal", description="The reasoning effort to use when generating text reasoning models"
     )
 
@@ -268,6 +269,12 @@ class AnthropicModelSettings(ModelSettings):
         description="Soft control for how verbose model output should be, used for GPT-5 models.",
     )
 
+    # Opus 4.5 effort parameter
+    effort: Optional[Literal["low", "medium", "high"]] = Field(
+        None,
+        description="Effort level for Opus 4.5 model (controls token conservation). Not setting this gives similar performance to 'high'.",
+    )
+
     # TODO: implement support for these
     # top_k: Optional[int] = Field(None, description="The number of top tokens to return.")
     # top_p: Optional[float] = Field(None, description="The top-p value to use when generating text.")
@@ -280,6 +287,7 @@ class AnthropicModelSettings(ModelSettings):
             "thinking_budget_tokens": self.thinking.budget_tokens,
             "verbosity": self.verbosity,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "effort": self.effort,
         }
 
 
@@ -354,6 +362,7 @@ class GroqModelSettings(ModelSettings):
             "temperature": self.temperature,
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
+            "parallel_tool_calls": self.parallel_tool_calls,
         }
 
 

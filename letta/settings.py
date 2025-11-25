@@ -352,6 +352,12 @@ class Settings(BaseSettings):
     # Archival memory token limit
     archival_memory_token_limit: int = 8192
 
+    # Security: Disable default actor fallback
+    no_default_actor: bool = Field(
+        default=False,
+        description="When true, prevents fallback to default actor in get_actor_or_default_async. Raises NoResultFound if actor_id is None.",
+    )
+
     @property
     def letta_pg_uri(self) -> str:
         if self.pg_uri:
@@ -409,9 +415,6 @@ class TelemetrySettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="letta_telemetry_", extra="ignore")
 
-    # Google Cloud Profiler
-    profiler: bool = Field(default=False, description="Enable Google Cloud Profiler.")
-
     # Datadog APM and Profiling
     enable_datadog: bool = Field(default=False, description="Enable Datadog profiling. Environment is pulled from settings.environment.")
     datadog_agent_host: str = Field(
@@ -420,6 +423,9 @@ class TelemetrySettings(BaseSettings):
     )
     datadog_agent_port: int = Field(default=8126, ge=1, le=65535, description="Datadog trace agent port (typically 8126 for traces).")
     datadog_service_name: str = Field(default="letta-server", description="Service name for Datadog profiling.")
+
+    datadog_profiling_enabled: bool = Field(default=False, description="Enable Datadog profiling.")
+
     datadog_profiling_memory_enabled: bool = Field(default=False, description="Enable memory profiling in Datadog.")
     datadog_profiling_heap_enabled: bool = Field(default=False, description="Enable heap profiling in Datadog.")
 
