@@ -812,13 +812,13 @@ class OpenAIBackcompatUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
-def count_tokens(s: str, model: str = "gpt-4") -> int:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-        print("Falling back to cl100k base for token counting.")
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(s))
+# def count_tokens(s: str, model: str = "gpt-4") -> int:
+#    try:
+#        encoding = tiktoken.encoding_for_model(model)
+#    except KeyError:
+#        print("Falling back to cl100k base for token counting.")
+#        encoding = tiktoken.get_encoding("cl100k_base")
+#    return len(encoding.encode(s))
 
 
 def printd(*args, **kwargs):
@@ -854,11 +854,16 @@ def parse_json(string) -> dict:
         raise e
 
 
-def validate_function_response(function_response: Any, return_char_limit: int, strict: bool = False, truncate: bool = True) -> str:
+def validate_function_response(
+    function_response: Any, return_char_limit: int, strict: bool = False, truncate: bool = True
+) -> str | dict[str, Any]:
     """Check to make sure that a function used by Letta returned a valid response. Truncates to return_char_limit if necessary.
 
-    This makes sure that we can coerce the function_response into a string that meets our criteria. We handle some soft coercion.
+    This makes sure that we can coerce the function_response into a string or dict that meets our criteria. We handle some soft coercion.
     If strict is True, we raise a ValueError if function_response is not a string or None.
+
+    Returns:
+        str or dict: Validated response. Dicts are returned as-is to avoid double JSON encoding by package_function_response.
     """
     if isinstance(function_response, str):
         function_response_string = function_response
@@ -870,9 +875,17 @@ def validate_function_response(function_response: Any, return_char_limit: int, s
         raise ValueError(f"Strict mode violation. Function returned type: {type(function_response).__name__}")
 
     elif isinstance(function_response, dict):
-        # As functions can return arbitrary data, if there's already nesting somewhere in the response, it's difficult
-        # for us to not result in double escapes.
-        function_response_string = json_dumps(function_response)
+        # For dicts, check if truncation is needed
+        if truncate and return_char_limit:
+            # Convert to JSON string to check size
+            json_str = json_dumps(function_response)
+            if len(json_str) > return_char_limit:
+                # If truncation is needed, return truncated string
+                logger.warning(f"function return was over limit ({len(json_str)} > {return_char_limit}) and was truncated")
+                return f"{json_str[:return_char_limit]}... [NOTE: function output was truncated since it exceeded the character limit ({len(json_str)} > {return_char_limit})]"
+        # Otherwise return dict as-is to avoid double JSON encoding
+        # package_function_response will handle the final JSON serialization
+        return function_response
     else:
         logger.debug(f"Function returned type {type(function_response).__name__}. Coercing to string.")
         function_response_string = str(function_response)
@@ -1110,6 +1123,19 @@ def get_background_task_count() -> int:
 
 @trace_method
 def safe_create_task(coro, label: str = "background task"):
+    # Check if coro is an async generator instead of a coroutine
+    if inspect.isasyncgen(coro):
+        raise TypeError(
+            f"{label}: Cannot create task from async generator. "
+            "Async generators must be consumed with 'async for', not 'await'. "
+            "If you need to run an async generator as a task, wrap it in an async function."
+        )
+
+    if not inspect.iscoroutine(coro):
+        raise TypeError(
+            f"{label}: Expected a coroutine, got {type(coro).__name__}. Make sure you're calling the async function with () parentheses."
+        )
+
     async def wrapper():
         try:
             await coro
@@ -1233,77 +1259,6 @@ def safe_create_file_processing_task(coro, file_metadata, server, actor, logger:
     task.add_done_callback(_background_tasks.discard)
 
     return task
-
-
-class CancellationSignal:
-    """
-    A signal that can be checked for cancellation during streaming operations.
-
-    This provides a lightweight way to check if an operation should be cancelled
-    without having to pass job managers and other dependencies through every method.
-    """
-
-    def __init__(self, job_manager=None, job_id=None, actor=None):
-        from letta.log import get_logger
-        from letta.schemas.user import User
-        from letta.services.job_manager import JobManager
-
-        self.job_manager: JobManager | None = job_manager
-        self.job_id: str | None = job_id
-        self.actor: User | None = actor
-        self._is_cancelled = False
-        self.logger = get_logger(__name__)
-
-    async def is_cancelled(self) -> bool:
-        """
-        Check if the operation has been cancelled.
-
-        Returns:
-            True if cancelled, False otherwise
-        """
-        from letta.schemas.enums import JobStatus
-
-        if self._is_cancelled:
-            return True
-
-        if not self.job_manager or not self.job_id or not self.actor:
-            return False
-
-        try:
-            job = await self.job_manager.get_job_by_id_async(job_id=self.job_id, actor=self.actor)
-            self._is_cancelled = job.status == JobStatus.cancelled
-            return self._is_cancelled
-        except Exception as e:
-            self.logger.warning(f"Failed to check cancellation status for job {self.job_id}: {e}")
-            return False
-
-    def cancel(self):
-        """Mark this signal as cancelled locally (for testing or direct cancellation)."""
-        self._is_cancelled = True
-
-    async def check_and_raise_if_cancelled(self):
-        """
-        Check for cancellation and raise CancelledError if cancelled.
-
-        Raises:
-            asyncio.CancelledError: If the operation has been cancelled
-        """
-        if await self.is_cancelled():
-            self.logger.info(f"Operation cancelled for job {self.job_id}")
-            raise asyncio.CancelledError(f"Job {self.job_id} was cancelled")
-
-
-class NullCancellationSignal(CancellationSignal):
-    """A null cancellation signal that is never cancelled."""
-
-    def __init__(self):
-        super().__init__()
-
-    async def is_cancelled(self) -> bool:
-        return False
-
-    async def check_and_raise_if_cancelled(self):
-        pass
 
 
 async def get_latest_alembic_revision() -> str:

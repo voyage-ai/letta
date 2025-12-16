@@ -155,8 +155,8 @@ class VoiceAgent(BaseAgent):
             max_files_open=agent_state.max_files_open,
             llm_config=agent_state.llm_config,
         )
-        letta_message_db_queue = create_input_messages(
-            input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, actor=self.actor
+        letta_message_db_queue = await create_input_messages(
+            input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=None, actor=self.actor
         )
         in_memory_message_history = self.pre_process_input_message(input_messages)
 
@@ -439,7 +439,7 @@ class VoiceAgent(BaseAgent):
 
         # Use ToolExecutionManager for modern tool execution
         # Decrypt environment variable values
-        sandbox_env_vars = {var.key: var.get_value_secret().get_plaintext() for var in agent_state.secrets}
+        sandbox_env_vars = {var.key: var.value_enc.get_plaintext() if var.value_enc else None for var in agent_state.secrets}
         tool_execution_manager = ToolExecutionManager(
             agent_state=agent_state,
             message_manager=self.message_manager,

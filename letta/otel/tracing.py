@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import itertools
+import json
 import re
 import time
 import traceback
@@ -90,6 +91,7 @@ async def _update_trace_attributes(request: Request):
         "user-agent": "client",
         "x-stainless-package-version": "sdk.version",
         "x-stainless-lang": "sdk.language",
+        "x-letta-source": "source",
     }
     for header_key, span_key in header_attributes.items():
         header_value = request.headers.get(header_key)
@@ -229,38 +231,45 @@ def trace_method(func):
                 param_items = param_items[1:]
 
             # Parameters to skip entirely (known to be large)
+            # This is opt-out: only skip specific large objects
             SKIP_PARAMS = {
                 "agent_state",
                 "messages",
                 "in_context_messages",
                 "message_sequence",
-                "content",
+                "content",  # File content, large text
                 "tool_returns",
                 "memory",
                 "sources",
                 "context",
-                "resource_id",
-                "source_code",
-                "request_data",
-                "system",
+                "source_code",  # Full code files
+                "system",  # System prompts
+                "text_chunks",  # Large arrays of text
+                "embeddings",  # Vector arrays
+                "embedding",  # Single vectors
+                "file_bytes",  # Binary data
+                "chunks",  # Large chunk arrays
             }
 
-            # Max size for parameter value strings (1KB)
-            MAX_PARAM_SIZE = 1024
-            # Max total size for all parameters (100KB)
-            MAX_TOTAL_SIZE = 1024 * 100
+            # Priority parameters that should ALWAYS be logged (exempt from opt-out)
+            NEVER_SKIP_PARAMS = {"request_data"}
+
+            # Max size for parameter value strings
+            MAX_PARAM_SIZE = 1024 * 1024 * 2  # 2MB (supports ~500k tokens)
+            # Max total size for all parameters
+            MAX_TOTAL_SIZE = 1024 * 1024 * 4  # 4MB
             total_size = 0
 
             for name, value in param_items:
                 try:
-                    # Check if we've exceeded total size limit
-                    if total_size > MAX_TOTAL_SIZE:
+                    # Check if we've exceeded total size limit (except for priority params)
+                    if total_size > MAX_TOTAL_SIZE and name not in NEVER_SKIP_PARAMS:
                         span.set_attribute("parameters.truncated", True)
                         span.set_attribute("parameters.truncated_reason", f"Total size exceeded {MAX_TOTAL_SIZE} bytes")
                         break
 
-                    # Skip parameters known to be large
-                    if name in SKIP_PARAMS:
+                    # Skip parameters known to be large (opt-out list, but respect ALWAYS_LOG)
+                    if name in SKIP_PARAMS and name not in NEVER_SKIP_PARAMS:
                         # Try to extract ID for observability
                         type_name = type(value).__name__
                         id_info = ""
@@ -407,6 +416,46 @@ def trace_method(func):
             return result
 
     return async_wrapper if inspect.iscoroutinefunction(func) else sync_wrapper
+
+
+def safe_json_dumps(data) -> str:
+    """
+    Safely serialize data to JSON, handling edge cases like byte arrays.
+
+    Used primarily for OTEL tracing to prevent serialization errors from
+    breaking the streaming flow when logging request/response data.
+
+    Args:
+        data: Data to serialize (dict, bytes, str, etc.)
+
+    Returns:
+        JSON string representation, or error message if serialization fails
+    """
+    try:
+        # Handle byte arrays (e.g., from Gemini)
+        if isinstance(data, bytes):
+            try:
+                # Try to decode as UTF-8 first
+                decoded = data.decode("utf-8")
+                # Try to parse as JSON
+                try:
+                    parsed = json.loads(decoded)
+                    return json.dumps(parsed)
+                except json.JSONDecodeError:
+                    # If not JSON, return the decoded string
+                    return json.dumps({"raw_text": decoded})
+            except UnicodeDecodeError:
+                # If decode fails, return base64 representation
+                import base64
+
+                return json.dumps({"base64": base64.b64encode(data).decode("ascii")})
+
+        # Normal case: try direct serialization
+        return json.dumps(data)
+    except Exception as e:
+        # Last resort: return error message
+        logger.warning(f"Failed to serialize data to JSON: {e}", exc_info=True)
+        return json.dumps({"error": f"Serialization failed: {str(e)}", "type": str(type(data))})
 
 
 def log_attributes(attributes: Dict[str, Any]) -> None:

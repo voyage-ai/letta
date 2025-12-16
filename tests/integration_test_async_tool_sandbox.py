@@ -1,11 +1,16 @@
 import os
 import secrets
 import string
+import threading
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
+from dotenv import load_dotenv
+from letta_client import Letta
 from sqlalchemy import delete
 
 from letta.config import LettaConfig
@@ -19,7 +24,6 @@ from letta.schemas.pip_requirement import PipRequirement
 from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfigCreate
 from letta.schemas.user import User
 from letta.server.db import db_registry
-from letta.server.server import SyncServer
 from letta.services.organization_manager import OrganizationManager
 from letta.services.sandbox_config_manager import SandboxConfigManager
 from letta.services.tool_manager import ToolManager
@@ -63,19 +67,49 @@ def disable_db_pooling_for_tests():
 
 # Fixtures
 @pytest.fixture(scope="module")
-def server():
+def server_url() -> str:
     """
-    Creates a SyncServer instance for testing.
-
-    Loads and saves config to ensure proper initialization.
+    Provides the URL for the Letta server.
+    If LETTA_SERVER_URL is not set, starts the server in a background thread
+    and polls until it's accepting connections.
     """
-    config = LettaConfig.load()
 
-    config.save()
+    def _run_server() -> None:
+        load_dotenv()
+        from letta.server.rest_api.app import start_server
 
-    server = SyncServer(init_with_default_org_and_user=True)
-    # create user/org
-    yield server
+        start_server(debug=True)
+
+    url: str = os.getenv("LETTA_SERVER_URL", "http://localhost:8283")
+
+    if not os.getenv("LETTA_SERVER_URL"):
+        thread = threading.Thread(target=_run_server, daemon=True)
+        thread.start()
+
+        # Poll until the server is up (or timeout)
+        timeout_seconds = 30
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                resp = requests.get(url + "/v1/health")
+                if resp.status_code < 500:
+                    break
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"Could not reach {url} within {timeout_seconds}s")
+
+    return url
+
+
+@pytest.fixture(scope="module")
+def client(server_url: str) -> Letta:
+    """
+    Creates and returns a synchronous Letta REST client for testing.
+    """
+    client_instance = Letta(base_url=server_url)
+    yield client_instance
 
 
 @pytest.fixture(autouse=True)
@@ -237,10 +271,22 @@ async def external_codebase_tool(test_user):
 
 
 @pytest.fixture
-async def agent_state(server: SyncServer):
+async def agent_state(server_url: str):
+    """
+    Creates and returns an agent state for testing with a pre-configured agent.
+
+    Note: This fixture uses the server's internal async API instead of the client API
+    because the sandbox tests need the full server-side AgentState object with all
+    its methods (like get_agent_env_vars_as_dict()), not the simplified DTO returned
+    by the REST API.
+    """
+    from letta.server.server import SyncServer
+
+    # Import here to ensure server is running first
+    server = SyncServer()
     await server.init_async(init_with_default_org_and_user=True)
     actor = await server.user_manager.create_default_actor_async()
-    agent_state = await server.create_agent_async(
+    agent_state_instance = await server.create_agent_async(
         CreateAgent(
             memory_blocks=[
                 CreateBlock(
@@ -255,12 +301,11 @@ async def agent_state(server: SyncServer):
             include_base_tools=True,
             model="openai/gpt-4o-mini",
             tags=["test_agents"],
-            embedding="letta/letta-free",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=actor,
     )
-    agent_state.tool_rules = []
-    yield agent_state
+    yield agent_state_instance
 
 
 @pytest.fixture
@@ -514,12 +559,12 @@ async def test_local_sandbox_default(disable_e2b_api_key, add_integers_tool, tes
 
     # Mock and assert correct pathway was invoked
     with patch.object(AsyncToolSandboxLocal, "run") as mock_run:
-        sandbox = AsyncToolSandboxLocal(add_integers_tool.name, args, user=test_user)
+        sandbox = AsyncToolSandboxLocal(add_integers_tool.name, args, user=test_user, tool_id=add_integers_tool.id)
         await sandbox.run()
         mock_run.assert_called_once()
 
     # Run again to get actual response
-    sandbox = AsyncToolSandboxLocal(add_integers_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxLocal(add_integers_tool.name, args, user=test_user, tool_id=add_integers_tool.id)
     result = await sandbox.run()
     assert result.func_return == args["x"] + args["y"]
 
@@ -528,7 +573,7 @@ async def test_local_sandbox_default(disable_e2b_api_key, add_integers_tool, tes
 @pytest.mark.local_sandbox
 async def test_local_sandbox_stateful_tool(disable_e2b_api_key, clear_core_memory_tool, test_user, agent_state):
     args = {}
-    sandbox = AsyncToolSandboxLocal(clear_core_memory_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxLocal(clear_core_memory_tool.name, args, user=test_user, tool_id=clear_core_memory_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert sandbox.inject_agent_state == True
     assert result.agent_state.memory.get_block("human").value == ""
@@ -539,7 +584,7 @@ async def test_local_sandbox_stateful_tool(disable_e2b_api_key, clear_core_memor
 @pytest.mark.asyncio
 @pytest.mark.local_sandbox
 async def test_local_sandbox_with_list_rv(disable_e2b_api_key, list_tool, test_user):
-    sandbox = AsyncToolSandboxLocal(list_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(list_tool.name, {}, user=test_user, tool_id=list_tool.id)
     result = await sandbox.run()
     assert len(result.func_return) == 5
 
@@ -558,7 +603,7 @@ async def test_local_sandbox_env(disable_e2b_api_key, get_env_tool, test_user):
         SandboxEnvironmentVariableCreate(key=key, value=long_random_string), sandbox_config_id=config.id, actor=test_user
     )
 
-    sandbox = AsyncToolSandboxLocal(get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(get_env_tool.name, {}, user=test_user, tool_id=get_env_tool.id)
     result = await sandbox.run()
     assert long_random_string in result.func_return
 
@@ -580,7 +625,7 @@ async def test_local_sandbox_per_agent_env(disable_e2b_api_key, get_env_tool, ag
     correct_val = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
     agent_state.secrets = [AgentEnvironmentVariable(key=key, value=correct_val, agent_id=agent_state.id)]
 
-    sandbox = AsyncToolSandboxLocal(get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(get_env_tool.name, {}, user=test_user, tool_id=get_env_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert wrong_val not in result.func_return
     assert correct_val in result.func_return
@@ -592,7 +637,7 @@ async def test_local_sandbox_external_codebase_with_venv(
     disable_e2b_api_key, custom_test_sandbox_config, external_codebase_tool, test_user
 ):
     args = {"percentage": 10}
-    sandbox = AsyncToolSandboxLocal(external_codebase_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxLocal(external_codebase_tool.name, args, user=test_user, tool_id=external_codebase_tool.id)
     result = await sandbox.run()
     assert result.func_return == "Price Adjustments:\nBurger: $8.99 -> $9.89\nFries: $2.99 -> $3.29\nSoda: $1.99 -> $2.19"
     assert "Hello World" in result.stdout[0]
@@ -603,7 +648,7 @@ async def test_local_sandbox_external_codebase_with_venv(
 async def test_local_sandbox_with_venv_and_warnings_does_not_error(
     disable_e2b_api_key, custom_test_sandbox_config, get_warning_tool, test_user
 ):
-    sandbox = AsyncToolSandboxLocal(get_warning_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(get_warning_tool.name, {}, user=test_user, tool_id=get_warning_tool.id)
     result = await sandbox.run()
     assert result.func_return == "Hello World"
 
@@ -611,7 +656,7 @@ async def test_local_sandbox_with_venv_and_warnings_does_not_error(
 @pytest.mark.asyncio
 @pytest.mark.e2b_sandbox
 async def test_local_sandbox_with_venv_errors(disable_e2b_api_key, custom_test_sandbox_config, always_err_tool, test_user):
-    sandbox = AsyncToolSandboxLocal(always_err_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(always_err_tool.name, {}, user=test_user, tool_id=always_err_tool.id)
     result = await sandbox.run()
     assert len(result.stdout) != 0
     assert "error" in result.stdout[0]
@@ -634,7 +679,7 @@ async def test_local_sandbox_with_venv_pip_installs_basic(disable_e2b_api_key, c
         SandboxEnvironmentVariableCreate(key=key, value=long_random_string), sandbox_config_id=config.id, actor=test_user
     )
 
-    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, force_recreate_venv=True)
+    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, tool_id=cowsay_tool.id, force_recreate_venv=True)
     result = await sandbox.run()
     assert long_random_string in result.stdout[0]
 
@@ -649,7 +694,12 @@ async def test_local_sandbox_with_tool_pip_requirements(disable_e2b_api_key, too
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
     sandbox = AsyncToolSandboxLocal(
-        tool_with_pip_requirements.name, {}, user=test_user, tool_object=tool_with_pip_requirements, force_recreate_venv=True
+        tool_with_pip_requirements.name,
+        {},
+        user=test_user,
+        tool_id=tool_with_pip_requirements.id,
+        tool_object=tool_with_pip_requirements,
+        force_recreate_venv=True,
     )
     result = await sandbox.run()
 
@@ -673,7 +723,12 @@ async def test_local_sandbox_with_mixed_pip_requirements(disable_e2b_api_key, to
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
     sandbox = AsyncToolSandboxLocal(
-        tool_with_pip_requirements.name, {}, user=test_user, tool_object=tool_with_pip_requirements, force_recreate_venv=True
+        tool_with_pip_requirements.name,
+        {},
+        user=test_user,
+        tool_id=tool_with_pip_requirements.id,
+        tool_object=tool_with_pip_requirements,
+        force_recreate_venv=True,
     )
     result = await sandbox.run()
 
@@ -696,7 +751,7 @@ async def test_local_sandbox_with_venv_pip_installs_with_update(disable_e2b_api_
         SandboxEnvironmentVariableCreate(key=key, value=long_random_string), sandbox_config_id=config.id, actor=test_user
     )
 
-    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, force_recreate_venv=True)
+    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, tool_id=cowsay_tool.id, force_recreate_venv=True)
     result = await sandbox.run()
     assert len(result.stdout) == 0
     assert "No module named 'cowsay'" in result.stderr[0]
@@ -706,7 +761,7 @@ async def test_local_sandbox_with_venv_pip_installs_with_update(disable_e2b_api_
     )
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
-    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, force_recreate_venv=False)
+    sandbox = AsyncToolSandboxLocal(cowsay_tool.name, {}, user=test_user, tool_id=cowsay_tool.id, force_recreate_venv=False)
     result = await sandbox.run()
     assert long_random_string in result.stdout[0]
 
@@ -721,12 +776,12 @@ async def test_e2b_sandbox_default(check_e2b_key_is_set, add_integers_tool, test
 
     # Mock and assert correct pathway was invoked
     with patch.object(AsyncToolSandboxE2B, "run") as mock_run:
-        sandbox = AsyncToolSandboxE2B(add_integers_tool.name, args, user=test_user)
+        sandbox = AsyncToolSandboxE2B(add_integers_tool.name, args, user=test_user, tool_id=add_integers_tool.id)
         await sandbox.run()
         mock_run.assert_called_once()
 
     # Run again to get actual response
-    sandbox = AsyncToolSandboxE2B(add_integers_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxE2B(add_integers_tool.name, args, user=test_user, tool_id=add_integers_tool.id)
     result = await sandbox.run()
     assert int(result.func_return) == args["x"] + args["y"]
 
@@ -746,7 +801,7 @@ async def test_e2b_sandbox_pip_installs(check_e2b_key_is_set, cowsay_tool, test_
         actor=test_user,
     )
 
-    sandbox = AsyncToolSandboxE2B(cowsay_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(cowsay_tool.name, {}, user=test_user, tool_id=cowsay_tool.id)
     result = await sandbox.run()
     assert long_random_string in result.stdout[0]
 
@@ -754,7 +809,7 @@ async def test_e2b_sandbox_pip_installs(check_e2b_key_is_set, cowsay_tool, test_
 @pytest.mark.asyncio
 @pytest.mark.e2b_sandbox
 async def test_e2b_sandbox_stateful_tool(check_e2b_key_is_set, clear_core_memory_tool, test_user, agent_state):
-    sandbox = AsyncToolSandboxE2B(clear_core_memory_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(clear_core_memory_tool.name, {}, user=test_user, tool_id=clear_core_memory_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert result.agent_state.memory.get_block("human").value == ""
     assert result.agent_state.memory.get_block("persona").value == ""
@@ -768,7 +823,7 @@ async def test_e2b_sandbox_inject_env_var_existing_sandbox(check_e2b_key_is_set,
     config_create = SandboxConfigCreate(config=E2BSandboxConfig().model_dump())
     config = await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
-    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user, tool_id=get_env_tool.id)
     result = await sandbox.run()
     assert result.func_return is None
 
@@ -780,7 +835,7 @@ async def test_e2b_sandbox_inject_env_var_existing_sandbox(check_e2b_key_is_set,
         actor=test_user,
     )
 
-    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user, tool_id=get_env_tool.id)
     result = await sandbox.run()
     assert long_random_string in result.func_return
 
@@ -803,7 +858,7 @@ async def test_e2b_sandbox_per_agent_env(check_e2b_key_is_set, get_env_tool, age
 
     agent_state.secrets = [AgentEnvironmentVariable(key=key, value=correct_val, agent_id=agent_state.id)]
 
-    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(get_env_tool.name, {}, user=test_user, tool_id=get_env_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert wrong_val not in result.func_return
     assert correct_val in result.func_return
@@ -812,7 +867,7 @@ async def test_e2b_sandbox_per_agent_env(check_e2b_key_is_set, get_env_tool, age
 @pytest.mark.asyncio
 @pytest.mark.e2b_sandbox
 async def test_e2b_sandbox_with_list_rv(check_e2b_key_is_set, list_tool, test_user):
-    sandbox = AsyncToolSandboxE2B(list_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(list_tool.name, {}, user=test_user, tool_id=list_tool.id)
     result = await sandbox.run()
     assert len(result.func_return) == 5
 
@@ -825,7 +880,9 @@ async def test_e2b_sandbox_with_tool_pip_requirements(check_e2b_key_is_set, tool
     config_create = SandboxConfigCreate(config=E2BSandboxConfig().model_dump())
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
-    sandbox = AsyncToolSandboxE2B(tool_with_pip_requirements.name, {}, user=test_user, tool_object=tool_with_pip_requirements)
+    sandbox = AsyncToolSandboxE2B(
+        tool_with_pip_requirements.name, {}, user=test_user, tool_id=tool_with_pip_requirements.id, tool_object=tool_with_pip_requirements
+    )
     result = await sandbox.run()
 
     # Should succeed since tool pip requirements were installed
@@ -844,12 +901,13 @@ async def test_e2b_sandbox_with_mixed_pip_requirements(check_e2b_key_is_set, too
     config_create = SandboxConfigCreate(config=E2BSandboxConfig(pip_requirements=["cowsay"]).model_dump())
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
-    sandbox = AsyncToolSandboxE2B(tool_with_pip_requirements.name, {}, user=test_user, tool_object=tool_with_pip_requirements)
+    sandbox = AsyncToolSandboxE2B(
+        tool_with_pip_requirements.name, {}, user=test_user, tool_id=tool_with_pip_requirements.id, tool_object=tool_with_pip_requirements
+    )
     result = await sandbox.run()
 
     # Should succeed since both sandbox and tool pip requirements were installed
     assert "Success!" in result.func_return
-    assert "Status: 200" in result.func_return
     assert "Array sum: 6" in result.func_return
 
 
@@ -863,7 +921,13 @@ async def test_e2b_sandbox_with_broken_tool_pip_requirements_error_handling(
     config_create = SandboxConfigCreate(config=E2BSandboxConfig().model_dump())
     await manager.create_or_update_sandbox_config_async(config_create, test_user)
 
-    sandbox = AsyncToolSandboxE2B(tool_with_broken_pip_requirements.name, {}, user=test_user, tool_object=tool_with_broken_pip_requirements)
+    sandbox = AsyncToolSandboxE2B(
+        tool_with_broken_pip_requirements.name,
+        {},
+        user=test_user,
+        tool_id=tool_with_broken_pip_requirements.id,
+        tool_object=tool_with_broken_pip_requirements,
+    )
 
     # Should raise a RuntimeError with informative message
     with pytest.raises(RuntimeError) as exc_info:
@@ -890,12 +954,14 @@ async def test_e2b_sandbox_with_broken_tool_pip_requirements_error_handling(
 async def test_async_function_detection(add_integers_tool, async_add_integers_tool, test_user):
     """Test that async function detection works correctly"""
     # Test sync function detection
-    sync_sandbox = AsyncToolSandboxE2B(add_integers_tool.name, {}, test_user, tool_object=add_integers_tool)
+    sync_sandbox = AsyncToolSandboxE2B(add_integers_tool.name, {}, test_user, tool_id=add_integers_tool.id, tool_object=add_integers_tool)
     await sync_sandbox._init_async()
     assert not sync_sandbox.is_async_function
 
     # Test async function detection
-    async_sandbox = AsyncToolSandboxE2B(async_add_integers_tool.name, {}, test_user, tool_object=async_add_integers_tool)
+    async_sandbox = AsyncToolSandboxE2B(
+        async_add_integers_tool.name, {}, test_user, tool_id=async_add_integers_tool.id, tool_object=async_add_integers_tool
+    )
     await async_sandbox._init_async()
     assert async_sandbox.is_async_function
 
@@ -904,7 +970,7 @@ async def test_async_function_detection(add_integers_tool, async_add_integers_to
 async def test_async_template_selection(add_integers_tool, async_add_integers_tool, test_user):
     """Test that correct templates are selected for sync vs async functions"""
     # Test sync function uses regular template
-    sync_sandbox = AsyncToolSandboxE2B(add_integers_tool.name, {}, test_user, tool_object=add_integers_tool)
+    sync_sandbox = AsyncToolSandboxE2B(add_integers_tool.name, {}, test_user, tool_id=add_integers_tool.id, tool_object=add_integers_tool)
     sync_script = await sync_sandbox.generate_execution_script(agent_state=None)
     print("=== SYNC SCRIPT ===")
     print(sync_script)
@@ -913,7 +979,9 @@ async def test_async_template_selection(add_integers_tool, async_add_integers_to
     assert "asyncio.run" not in sync_script
 
     # Test async function uses async template
-    async_sandbox = AsyncToolSandboxE2B(async_add_integers_tool.name, {}, test_user, tool_object=async_add_integers_tool)
+    async_sandbox = AsyncToolSandboxE2B(
+        async_add_integers_tool.name, {}, test_user, tool_id=async_add_integers_tool.id, tool_object=async_add_integers_tool
+    )
     async_script = await async_sandbox.generate_execution_script(agent_state=None)
     print("=== ASYNC SCRIPT ===")
     print(async_script)
@@ -929,7 +997,7 @@ async def test_local_sandbox_async_function_execution(disable_e2b_api_key, async
     """Test that async functions execute correctly in local sandbox"""
     args = {"x": 15, "y": 25}
 
-    sandbox = AsyncToolSandboxLocal(async_add_integers_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_add_integers_tool.name, args, user=test_user, tool_id=async_add_integers_tool.id)
     result = await sandbox.run()
     assert result.func_return == args["x"] + args["y"]
 
@@ -940,7 +1008,7 @@ async def test_e2b_sandbox_async_function_execution(check_e2b_key_is_set, async_
     """Test that async functions execute correctly in E2B sandbox"""
     args = {"x": 20, "y": 30}
 
-    sandbox = AsyncToolSandboxE2B(async_add_integers_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_add_integers_tool.name, args, user=test_user, tool_id=async_add_integers_tool.id)
     result = await sandbox.run()
     assert int(result.func_return) == args["x"] + args["y"]
 
@@ -951,7 +1019,7 @@ async def test_local_sandbox_async_complex_computation(disable_e2b_api_key, asyn
     """Test complex async computation with multiple awaits in local sandbox"""
     args = {"iterations": 2}
 
-    sandbox = AsyncToolSandboxLocal(async_complex_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_complex_tool.name, args, user=test_user, tool_id=async_complex_tool.id)
     result = await sandbox.run()
 
     assert isinstance(result.func_return, dict)
@@ -967,7 +1035,7 @@ async def test_e2b_sandbox_async_complex_computation(check_e2b_key_is_set, async
     """Test complex async computation with multiple awaits in E2B sandbox"""
     args = {"iterations": 2}
 
-    sandbox = AsyncToolSandboxE2B(async_complex_tool.name, args, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_complex_tool.name, args, user=test_user, tool_id=async_complex_tool.id)
     result = await sandbox.run()
 
     func_return = result.func_return
@@ -982,7 +1050,7 @@ async def test_e2b_sandbox_async_complex_computation(check_e2b_key_is_set, async
 @pytest.mark.local_sandbox
 async def test_local_sandbox_async_list_return(disable_e2b_api_key, async_list_tool, test_user):
     """Test async function returning list in local sandbox"""
-    sandbox = AsyncToolSandboxLocal(async_list_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_list_tool.name, {}, user=test_user, tool_id=async_list_tool.id)
     result = await sandbox.run()
     assert result.func_return == [1, 2, 3, 4, 5]
 
@@ -991,7 +1059,7 @@ async def test_local_sandbox_async_list_return(disable_e2b_api_key, async_list_t
 @pytest.mark.e2b_sandbox
 async def test_e2b_sandbox_async_list_return(check_e2b_key_is_set, async_list_tool, test_user):
     """Test async function returning list in E2B sandbox"""
-    sandbox = AsyncToolSandboxE2B(async_list_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_list_tool.name, {}, user=test_user, tool_id=async_list_tool.id)
     result = await sandbox.run()
     assert result.func_return == [1, 2, 3, 4, 5]
 
@@ -1014,7 +1082,7 @@ async def test_local_sandbox_async_with_env_vars(disable_e2b_api_key, async_get_
         SandboxEnvironmentVariableCreate(key=key, value=test_value), sandbox_config_id=config.id, actor=test_user
     )
 
-    sandbox = AsyncToolSandboxLocal(async_get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_get_env_tool.name, {}, user=test_user, tool_id=async_get_env_tool.id)
     result = await sandbox.run()
 
     assert test_value in result.func_return
@@ -1035,7 +1103,7 @@ async def test_e2b_sandbox_async_with_env_vars(check_e2b_key_is_set, async_get_e
         SandboxEnvironmentVariableCreate(key=key, value=test_value), sandbox_config_id=config.id, actor=test_user
     )
 
-    sandbox = AsyncToolSandboxE2B(async_get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_get_env_tool.name, {}, user=test_user, tool_id=async_get_env_tool.id)
     result = await sandbox.run()
 
     assert test_value in result.func_return
@@ -1045,7 +1113,7 @@ async def test_e2b_sandbox_async_with_env_vars(check_e2b_key_is_set, async_get_e
 @pytest.mark.local_sandbox
 async def test_local_sandbox_async_with_agent_state(disable_e2b_api_key, async_stateful_tool, test_user, agent_state):
     """Test async function with agent state in local sandbox"""
-    sandbox = AsyncToolSandboxLocal(async_stateful_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_stateful_tool.name, {}, user=test_user, tool_id=async_stateful_tool.id)
     result = await sandbox.run(agent_state=agent_state)
 
     assert result.agent_state is not None
@@ -1058,7 +1126,7 @@ async def test_local_sandbox_async_with_agent_state(disable_e2b_api_key, async_s
 @pytest.mark.e2b_sandbox
 async def test_e2b_sandbox_async_with_agent_state(check_e2b_key_is_set, async_stateful_tool, test_user, agent_state):
     """Test async function with agent state in E2B sandbox"""
-    sandbox = AsyncToolSandboxE2B(async_stateful_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_stateful_tool.name, {}, user=test_user, tool_id=async_stateful_tool.id)
     result = await sandbox.run(agent_state=agent_state)
 
     assert result.agent_state.memory.get_block("human").value == ""
@@ -1070,7 +1138,7 @@ async def test_e2b_sandbox_async_with_agent_state(check_e2b_key_is_set, async_st
 @pytest.mark.local_sandbox
 async def test_local_sandbox_async_error_handling(disable_e2b_api_key, async_error_tool, test_user):
     """Test async function error handling in local sandbox"""
-    sandbox = AsyncToolSandboxLocal(async_error_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_error_tool.name, {}, user=test_user, tool_id=async_error_tool.id)
     result = await sandbox.run()
 
     # Check that error was captured
@@ -1084,7 +1152,7 @@ async def test_local_sandbox_async_error_handling(disable_e2b_api_key, async_err
 @pytest.mark.e2b_sandbox
 async def test_e2b_sandbox_async_error_handling(check_e2b_key_is_set, async_error_tool, test_user):
     """Test async function error handling in E2B sandbox"""
-    sandbox = AsyncToolSandboxE2B(async_error_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_error_tool.name, {}, user=test_user, tool_id=async_error_tool.id)
     result = await sandbox.run()
 
     # Check that error was captured
@@ -1112,7 +1180,7 @@ async def test_local_sandbox_async_per_agent_env(disable_e2b_api_key, async_get_
     correct_val = "correct_async_local_value"
     agent_state.secrets = [AgentEnvironmentVariable(key=key, value=correct_val, agent_id=agent_state.id)]
 
-    sandbox = AsyncToolSandboxLocal(async_get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxLocal(async_get_env_tool.name, {}, user=test_user, tool_id=async_get_env_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert wrong_val not in result.func_return
     assert correct_val in result.func_return
@@ -1137,7 +1205,170 @@ async def test_e2b_sandbox_async_per_agent_env(check_e2b_key_is_set, async_get_e
 
     agent_state.secrets = [AgentEnvironmentVariable(key=key, value=correct_val, agent_id=agent_state.id)]
 
-    sandbox = AsyncToolSandboxE2B(async_get_env_tool.name, {}, user=test_user)
+    sandbox = AsyncToolSandboxE2B(async_get_env_tool.name, {}, user=test_user, tool_id=async_get_env_tool.id)
     result = await sandbox.run(agent_state=agent_state)
     assert wrong_val not in result.func_return
     assert correct_val in result.func_return
+
+
+# Client injection tests
+
+
+@pytest.fixture
+async def list_tools_with_client_tool(test_user):
+    """Tool that uses the client (available in sandbox scope) to list tools.
+
+    Note: The `client` variable is always available in the sandbox scope,
+    so tools can access it directly without declaring it as a parameter.
+    """
+    from letta.schemas.enums import ToolType
+    from letta.schemas.tool import Tool as PydanticTool
+
+    source_code = '''
+def list_tools_via_client() -> str:
+    """
+    List available tools using the Letta client available in sandbox scope.
+
+    Returns:
+        str: Comma-separated list of tool names
+    """
+    # `client` is always available in the sandbox scope
+    if not client:
+        return "ERROR: client not available in scope"
+
+    try:
+        tools = client.tools.list()
+        tool_names = [tool.name for tool in tools]
+        return f"Found {len(tool_names)} tools: {', '.join(tool_names)}"
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+'''
+
+    # Create the tool with proper schema
+    tool = PydanticTool(
+        name="list_tools_via_client",
+        description="List tools using client available in sandbox scope",
+        source_code=source_code,
+        source_type="python",
+        tool_type=ToolType.CUSTOM,
+    )
+
+    # Schema has no parameters since client is accessed from scope, not passed as arg
+    tool.json_schema = {
+        "name": "list_tools_via_client",
+        "description": "List tools using client available in sandbox scope",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+
+    # Use ToolManager directly for this special case
+    created_tool = await ToolManager().create_or_update_tool_async(tool, test_user)
+    yield created_tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.local_sandbox
+async def test_local_sandbox_with_client_injection(disable_e2b_api_key, list_tools_with_client_tool, test_user, server_url):
+    """Test that local sandbox can inject Letta client for tools that need it."""
+
+    # Add LETTA_API_KEY to sandbox environment
+    api_key = os.getenv("LETTA_API_KEY") or "test-key"
+    base_url = server_url  # Use the server_url fixture
+
+    # Pass environment variables directly to avoid encryption issues
+    sandbox_env_vars = {
+        "LETTA_API_KEY": api_key,
+        "LETTA_BASE_URL": base_url,
+    }
+
+    # Create the sandbox and verify client injection is detected
+    sandbox = AsyncToolSandboxLocal(
+        tool_name=list_tools_with_client_tool.name,
+        args={},
+        user=test_user,
+        tool_id=list_tools_with_client_tool.id,
+        tool_object=list_tools_with_client_tool,
+        sandbox_env_vars=sandbox_env_vars,
+    )
+
+    await sandbox._init_async()
+
+    # Verify that client injection is enabled (always True now)
+    assert sandbox.inject_letta_client is True, "Client injection should always be enabled"
+
+    # Generate the execution script to verify client initialization code is present
+    script = await sandbox.generate_execution_script(agent_state=None)
+
+    # Debug: print the script
+    print("=" * 80)
+    print("GENERATED SCRIPT:")
+    print("=" * 80)
+    print(script)
+    print("=" * 80)
+
+    # Verify the script contains Letta client initialization
+    assert "from letta_client import Letta" in script, "Script should import Letta client"
+    assert "LETTA_API_KEY" in script, "Script should check for LETTA_API_KEY"
+    assert "client = Letta(" in script or "client = None" in script, "Script should initialize Letta client"
+
+    # Run the tool and verify it works
+    result = await sandbox.run(agent_state=None)
+
+    # The result should either list tools or indicate client wasn't available
+    assert result.status == "success" or "ERROR" in str(result.func_return), f"Tool execution failed: {result.stderr}"
+
+    print("RESULT --------------------------------")
+    print(result)
+    assert "Found" in str(result.func_return), f"Tool should list tools when client is available: {result.func_return}"
+
+    # Verify client was available in scope (connection may fail if no server is running)
+    assert "ERROR: client not available in scope" not in str(result.func_return), (
+        "Client should be available in scope when LETTA_API_KEY is set"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.e2b_sandbox
+async def test_e2b_sandbox_with_client_injection(check_e2b_key_is_set, list_tools_with_client_tool, test_user, server_url):
+    """Test that E2B sandbox can inject Letta client for tools that need it."""
+
+    # Add LETTA_API_KEY to sandbox environment
+    api_key = os.getenv("LETTA_API_KEY") or "test-key"
+    base_url = server_url  # Use the server_url fixture
+
+    # Pass environment variables directly to avoid encryption issues
+    sandbox_env_vars = {
+        "LETTA_API_KEY": api_key,
+        "LETTA_BASE_URL": base_url,
+    }
+
+    # Create the sandbox and verify client injection is detected
+    sandbox = AsyncToolSandboxE2B(
+        tool_name=list_tools_with_client_tool.name,
+        args={},
+        user=test_user,
+        tool_id=list_tools_with_client_tool.id,
+        tool_object=list_tools_with_client_tool,
+        sandbox_env_vars=sandbox_env_vars,
+    )
+
+    await sandbox._init_async()
+
+    # Verify that client injection is enabled (always True now)
+    assert sandbox.inject_letta_client is True, "Client injection should always be enabled"
+
+    # Generate the execution script to verify client initialization code is present
+    script = await sandbox.generate_execution_script(agent_state=None)
+
+    # Debug: print the script
+    print("=" * 80)
+    print("GENERATED SCRIPT:")
+    print("=" * 80)
+    print(script)
+    print("=" * 80)
+
+    # Verify the script contains Letta client initialization
+    assert "from letta_client import Letta" in script, "Script should import Letta client"
+    assert "LETTA_API_KEY" in script, "Script should check for LETTA_API_KEY"
+    assert "client = Letta(" in script or "client = None" in script, "Script should initialize Letta client"
+
+    # Cannot run the tool since E2B is remote

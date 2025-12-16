@@ -9,6 +9,7 @@ from letta.constants import (
     RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE,
 )
 from letta.helpers.json_helpers import json_dumps
+from letta.helpers.tpuf_client import should_use_tpuf_for_messages
 from letta.log import get_logger
 from letta.schemas.agent import AgentState
 from letta.schemas.block import BlockUpdate
@@ -87,7 +88,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         limit: Optional[int] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> Optional[dict]:
         try:
             # Parse datetime parameters if provided
             start_datetime = None
@@ -148,10 +149,27 @@ class LettaCoreToolExecutor(ToolExecutor):
                 end_date=end_datetime,
             )
 
-            if len(message_results) == 0:
-                results_str = "No results found."
+            # Filter out tool messages to prevent recursive results and exponential escaping
+            from letta.constants import CONVERSATION_SEARCH_TOOL_NAME
+
+            filtered_results = []
+            for message, metadata in message_results:
+                # Skip ALL tool messages - they contain tool execution results
+                # which can cause recursive nesting and exponential escaping
+                if message.role == MessageRole.tool:
+                    continue
+
+                # Also skip assistant messages that call conversation_search
+                # These can contain the search query which may lead to confusing results
+                if message.role == MessageRole.assistant and message.tool_calls:
+                    if CONVERSATION_SEARCH_TOOL_NAME in [tool_call.function.name for tool_call in message.tool_calls]:
+                        continue
+
+                filtered_results.append((message, metadata))
+
+            if len(filtered_results) == 0:
+                return {"message": "No results found.", "results": []}
             else:
-                results_pref = f"Showing {len(message_results)} results:"
                 results_formatted = []
                 # get current time in UTC, then convert to agent timezone for consistent comparison
                 from datetime import timezone
@@ -166,7 +184,7 @@ class LettaCoreToolExecutor(ToolExecutor):
                 else:
                     now = now_utc
 
-                for message, metadata in message_results:
+                for message, metadata in filtered_results:
                     # Format timestamp in agent's timezone if available
                     timestamp = message.created_at
                     time_delta_str = ""
@@ -249,10 +267,11 @@ class LettaCoreToolExecutor(ToolExecutor):
 
                     results_formatted.append(result_dict)
 
-                # Don't double-encode - results_formatted already has the parsed content
-                results_str = f"{results_pref} {json_dumps(results_formatted)}"
-
-            return results_str
+                # Return structured dict instead of JSON string to avoid double-encoding
+                return {
+                    "message": f"Showing {len(message_results)} results:",
+                    "results": results_formatted,
+                }
 
         except Exception as e:
             raise e
@@ -627,7 +646,7 @@ class LettaCoreToolExecutor(ToolExecutor):
     async def memory_delete(self, agent_state: AgentState, actor: User, path: str) -> str:
         """Delete a memory block by detaching it from the agent."""
         # Extract memory block label from path
-        label = path.removeprefix("/memories/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         try:
             # Check if memory block exists
@@ -650,7 +669,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
     async def memory_update_description(self, agent_state: AgentState, actor: User, path: str, description: str) -> str:
         """Update the description of a memory block."""
-        label = path.removeprefix("/memories/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         try:
             # Check if old memory block exists
@@ -671,8 +690,8 @@ class LettaCoreToolExecutor(ToolExecutor):
     async def memory_rename(self, agent_state: AgentState, actor: User, old_path: str, new_path: str) -> str:
         """Rename a memory block by copying content to new label and detaching old one."""
         # Extract memory block labels from paths
-        old_label = old_path.removeprefix("/memories/").replace("/", "_")
-        new_label = new_path.removeprefix("/memories/").replace("/", "_")
+        old_label = old_path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
+        new_label = new_path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         try:
             # Check if old memory block exists
@@ -694,7 +713,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         """Create a memory block by setting its value to an empty string."""
         from letta.schemas.block import Block
 
-        label = path.removeprefix("/memories/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         # Create a new block and persist it to the database
         new_block = Block(label=label, value=file_text if file_text else "", description=description)
@@ -711,7 +730,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
     async def memory_str_replace(self, agent_state: AgentState, actor: User, path: str, old_str: str, new_str: str) -> str:
         """Replace text in a memory block."""
-        label = path.removeprefix("/memories/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         memory_block = agent_state.memory.get_block(label)
         if memory_block is None:
@@ -774,7 +793,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
     async def memory_str_insert(self, agent_state: AgentState, actor: User, path: str, insert_text: str, insert_line: int = -1) -> str:
         """Insert text into a memory block at a specific line."""
-        label = path.removeprefix("/memories/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
         memory_block = agent_state.memory.get_block(label)
         if memory_block is None:

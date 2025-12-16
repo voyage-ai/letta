@@ -1,8 +1,8 @@
 from collections import defaultdict
 from typing import ClassVar, Literal
 
-import requests
-from openai import AzureOpenAI
+import httpx
+from openai import AsyncAzureOpenAI
 from pydantic import Field, field_validator
 
 from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE, LLM_MAX_TOKENS
@@ -36,7 +36,7 @@ class AzureProvider(Provider):
     base_url: str = Field(
         ..., description="Base URL for the Azure API endpoint. This should be specific to your org, e.g. `https://letta.openai.azure.com`."
     )
-    api_key: str = Field(..., description="API key for the Azure API.")
+    api_key: str | None = Field(None, description="API key for the Azure API.", deprecated=True)
     api_version: str = Field(default=LATEST_API_VERSION, description="API version for the Azure API")
 
     @field_validator("api_version", mode="before")
@@ -57,14 +57,14 @@ class AzureProvider(Provider):
         # That's the only api version that works with this deployments endpoint
         return f"{self.base_url}/openai/deployments?api-version=2023-03-15-preview"
 
-    def azure_openai_get_deployed_model_list(self) -> list:
+    async def azure_openai_get_deployed_model_list(self) -> list:
         """https://learn.microsoft.com/en-us/rest/api/azureopenai/models/list?view=rest-azureopenai-2023-05-15&tabs=HTTP"""
 
-        api_key = self.get_api_key_secret().get_plaintext()
-        client = AzureOpenAI(api_key=api_key, api_version=self.api_version, azure_endpoint=self.base_url)
+        api_key = self.api_key_enc.get_plaintext() if self.api_key_enc else None
+        client = AsyncAzureOpenAI(api_key=api_key, api_version=self.api_version, azure_endpoint=self.base_url)
 
         try:
-            models_list = client.models.list()
+            models_list = await client.models.list()
         except Exception:
             return []
 
@@ -78,9 +78,14 @@ class AzureProvider(Provider):
         # 2. Get all the deployed models
         url = self.get_azure_deployment_list_endpoint()
         try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-        except requests.RequestException as e:
+            # Azure API can be slow (8+ seconds), use a generous timeout
+            timeout = httpx.Timeout(15.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as http_client:
+                response = await http_client.get(url, headers=headers)
+                response.raise_for_status()
+        except httpx.TimeoutException as e:
+            raise RuntimeError(f"Azure API timeout after 15s: {e}")
+        except httpx.HTTPStatusError as e:
             raise RuntimeError(f"Failed to retrieve model list: {e}")
 
         deployed_models = response.json().get("data", [])
@@ -106,8 +111,7 @@ class AzureProvider(Provider):
         return list(latest_models.values())
 
     async def list_llm_models_async(self) -> list[LLMConfig]:
-        # TODO (cliandy): asyncify
-        model_list = self.azure_openai_get_deployed_model_list()
+        model_list = await self.azure_openai_get_deployed_model_list()
         # Extract models that support text generation
         model_options = [m for m in model_list if m.get("capabilities").get("chat_completion") == True]
 
@@ -130,7 +134,6 @@ class AzureProvider(Provider):
         return configs
 
     async def list_embedding_models_async(self) -> list[EmbeddingConfig]:
-        # TODO (cliandy): asyncify dependent function calls
         def valid_embedding_model(m: dict, require_embedding_in_name: bool = True):
             valid_name = True
             if require_embedding_in_name:
@@ -138,7 +141,7 @@ class AzureProvider(Provider):
 
             return m.get("capabilities").get("embeddings") == True and valid_name
 
-        model_list = self.azure_openai_get_deployed_model_list()
+        model_list = await self.azure_openai_get_deployed_model_list()
         # Extract models that support embeddings
 
         model_options = [m for m in model_list if valid_embedding_model(m)]
@@ -166,7 +169,7 @@ class AzureProvider(Provider):
         return AZURE_MODEL_TO_CONTEXT_LENGTH.get(model_name, llm_default)
 
     async def check_api_key(self):
-        api_key = self.get_api_key_secret().get_plaintext()
+        api_key = self.api_key_enc.get_plaintext() if self.api_key_enc else None
         if not api_key:
             raise ValueError("No API key provided")
 

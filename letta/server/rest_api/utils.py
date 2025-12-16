@@ -155,7 +155,9 @@ def capture_sentry_exception(e: BaseException):
         sentry_sdk.capture_exception(e)
 
 
-def create_input_messages(input_messages: List[MessageCreate], agent_id: str, timezone: str, run_id: str, actor: User) -> List[Message]:
+async def create_input_messages(
+    input_messages: List[MessageCreate], agent_id: str, timezone: str, run_id: str, actor: User
+) -> List[Message]:
     """
     Converts a user input message into the internal structured format.
 
@@ -163,7 +165,7 @@ def create_input_messages(input_messages: List[MessageCreate], agent_id: str, ti
     we should unify this when it's clear what message attributes we need.
     """
 
-    messages = convert_message_creates_to_messages(
+    messages = await convert_message_creates_to_messages(
         input_messages, agent_id, timezone, run_id, wrap_user_message=False, wrap_system_message=False
     )
     return messages
@@ -209,6 +211,80 @@ def create_approval_response_message_from_input(
             else (agent_state.multi_agent_group.id if agent_state.multi_agent_group else None),
         )
     ]
+
+
+def create_tool_returns_for_denials(
+    tool_calls: List[OpenAIToolCall],
+    denial_reason: str,
+    timezone: str,
+) -> List[ToolReturn]:
+    """
+    Create ToolReturn objects with error status for denied tool calls.
+
+    This is used when tool calls are denied either by:
+    - User explicitly denying approval
+    - Run cancellation (automated denial)
+
+    Args:
+        tool_calls: List of tool calls that were denied
+        denial_reason: Reason for denial (e.g., user reason or cancellation message)
+        timezone: Agent timezone for timestamp formatting
+
+    Returns:
+        List of ToolReturn objects with error status
+    """
+    tool_returns = []
+    for tool_call in tool_calls:
+        tool_call_id = tool_call.id or f"call_{uuid.uuid4().hex[:8]}"
+        packaged_function_response = package_function_response(
+            was_success=False,
+            response_string=f"Error: request to call tool denied. User reason: {denial_reason}",
+            timezone=timezone,
+        )
+        tool_return = ToolReturn(
+            tool_call_id=tool_call_id,
+            func_response=packaged_function_response,
+            status="error",
+        )
+        tool_returns.append(tool_return)
+    return tool_returns
+
+
+def create_tool_message_from_returns(
+    agent_id: str,
+    model: str,
+    tool_returns: List[ToolReturn],
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+) -> Message:
+    """
+    Create a tool message with error returns for denied/failed tool calls.
+
+    This creates a properly formatted tool message that can be added to the
+    conversation history to reflect tool call denials or failures.
+
+    Args:
+        agent_id: ID of the agent
+        model: Model identifier
+        tool_returns: List of ToolReturn objects (typically with error status)
+        run_id: Optional run ID
+        step_id: Optional step ID
+
+    Returns:
+        Message with role="tool" containing the tool returns
+    """
+    return Message(
+        role=MessageRole.tool,
+        content=[TextContent(text=tr.func_response) for tr in tool_returns],
+        agent_id=agent_id,
+        model=model,
+        tool_calls=[],
+        tool_call_id=tool_returns[0].tool_call_id if tool_returns else None,
+        tool_returns=tool_returns,
+        run_id=run_id,
+        step_id=step_id,
+        created_at=get_utc_time(),
+    )
 
 
 def create_approval_request_message_from_llm_response(
@@ -521,9 +597,10 @@ def create_parallel_tool_messages_from_llm_response(
         agent_id=agent_id,
         model=model,
         tool_calls=[],
-        tool_call_id=tool_returns[0].tool_call_id,  # For legacy reasons, set to first one
+        tool_call_id=tool_returns[0].tool_call_id if tool_returns else None,  # For legacy reasons, set to first one
         created_at=get_utc_time(),
         batch_item_id=llm_batch_item_id,
+        name=tool_call_specs[0].get("name") if tool_call_specs else None,  # For legacy reasons, set to first one
         tool_returns=tool_returns,
         run_id=run_id,
     )
@@ -695,3 +772,89 @@ def get_user_message_from_chat_completions_request(completion_request: Completio
     for message in reversed(messages):
         if message["role"] == "user":
             return [MessageCreate(role=MessageRole.user, content=[TextContent(text=message["content"])])]
+
+
+# ============================================================================
+# Message Capture Utilities (for Anthropic proxy and other external APIs)
+# ============================================================================
+
+
+async def capture_and_persist_messages(
+    server,
+    agent,
+    actor,
+    user_messages: list[str],
+    assistant_message: str,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Capture user and assistant messages and persist them to the database.
+
+    Args:
+        server: SyncServer instance
+        agent_id: Agent ID to associate messages with
+        actor: Actor performing the operation
+        user_messages: List of user message texts
+        assistant_message: Assistant response text
+        model: Optional model name used for the response
+
+    Returns:
+        dict with success status, message count, and any run IDs
+    """
+    messages_to_persist = []
+
+    # Add user messages
+    for user_msg in user_messages:
+        messages_to_persist.append(
+            Message(
+                role=MessageRole.user,
+                content=[TextContent(text=user_msg)],
+                agent_id=agent.id,
+                tool_calls=None,
+                tool_call_id=None,
+                created_at=get_utc_time(),
+            )
+        )
+
+    # Add assistant response
+    if assistant_message:
+        messages_to_persist.append(
+            Message(
+                role=MessageRole.assistant,
+                content=[TextContent(text=assistant_message)],
+                agent_id=agent.id,
+                model=model,
+                tool_calls=None,
+                tool_call_id=None,
+                created_at=get_utc_time(),
+            )
+        )
+
+    # Persist to database
+    response_messages = await server.message_manager.create_many_messages_async(messages_to_persist, actor=actor)
+
+    logger.info(f"Persisted {len(response_messages)} messages for agent {agent.id}")
+
+    # Check if sleeptime agents need to run
+    run_ids = []
+    try:
+        sleeptime_group = (
+            agent.multi_agent_group if agent.multi_agent_group and agent.multi_agent_group.manager_type == "sleeptime" else None
+        )
+
+        if sleeptime_group:
+            from letta.groups.sleeptime_multi_agent_v4 import SleeptimeMultiAgentV4
+
+            sleeptime_agent_loop = SleeptimeMultiAgentV4(agent_state=agent, actor=actor, group=sleeptime_group)
+            sleeptime_agent_loop.response_messages = response_messages
+            run_ids = await sleeptime_agent_loop.run_sleeptime_agents()
+            logger.info(f"Triggered sleeptime agents, run_ids: {run_ids}")
+
+    except Exception as e:
+        logger.warning(f"Failed to run sleeptime agents: {e}")
+
+    return {
+        "success": True,
+        "messages_created": len(response_messages),
+        "run_ids": run_ids,
+    }

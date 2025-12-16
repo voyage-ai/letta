@@ -1,11 +1,14 @@
+import json
 import os
 import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from dotenv import load_dotenv
-from letta_client import AgentState, Letta, MessageCreate
-from letta_client.core.api_error import ApiError
+from letta_client import APIError, Letta
+from letta_client.types import MessageCreateParam
+from letta_client.types.agent_state import AgentState
 from sqlalchemy import delete
 
 from letta.orm import SandboxConfig, SandboxEnvironmentVariable
@@ -34,7 +37,114 @@ def run_server():
 @pytest.fixture(
     scope="module",
 )
-def client(request):
+def mock_openai_server():
+    """Local mock for the OpenAI API used by tests.
+
+    These tests should not require a real OPENAI_API_KEY.
+    We still exercise the OpenAI embeddings codepath by serving a minimal subset of the API.
+    """
+
+    EMBED_DIM = 1536
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            # Silence noisy HTTP server logs during tests
+            return
+
+        def _send_json(self, status_code: int, payload: dict):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            # Support OpenAI model listing used during provider sync.
+            if self.path in ("/v1/models", "/models"):
+                self._send_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [
+                            {"id": "gpt-4o-mini", "object": "model", "context_length": 128000},
+                            {"id": "gpt-4.1", "object": "model", "context_length": 128000},
+                            {"id": "gpt-4o", "object": "model", "context_length": 128000},
+                        ],
+                    },
+                )
+                return
+
+            self._send_json(404, {"error": {"message": f"Not found: {self.path}"}})
+
+        def do_POST(self):  # noqa: N802
+            # Support embeddings endpoint
+            if self.path not in ("/v1/embeddings", "/embeddings"):
+                self._send_json(404, {"error": {"message": f"Not found: {self.path}"}})
+                return
+
+            content_len = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(content_len) if content_len else b"{}"
+            try:
+                req = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"error": {"message": "Invalid JSON"}})
+                return
+
+            inputs = req.get("input", [])
+            if isinstance(inputs, str):
+                inputs = [inputs]
+
+            if not isinstance(inputs, list):
+                self._send_json(400, {"error": {"message": "'input' must be a string or list"}})
+                return
+
+            data = [{"object": "embedding", "index": i, "embedding": [0.0] * EMBED_DIM} for i in range(len(inputs))]
+            self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": data,
+                    "model": req.get("model", "text-embedding-3-small"),
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                },
+            )
+
+    # Bind to an ephemeral port
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}/v1"
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    # Ensure the Letta server uses this mock OpenAI endpoint.
+    # We *override* values here because a developer's local .env may contain a stale key.
+    prev_openai_api_key = os.environ.get("OPENAI_API_KEY")
+    prev_openai_base_url = os.environ.get("OPENAI_BASE_URL")
+    os.environ["OPENAI_API_KEY"] = "DUMMY_API_KEY"
+    os.environ["OPENAI_BASE_URL"] = base_url
+
+    yield base_url
+
+    # Restore env
+    if prev_openai_api_key is None:
+        os.environ.pop("OPENAI_API_KEY", None)
+    else:
+        os.environ["OPENAI_API_KEY"] = prev_openai_api_key
+    if prev_openai_base_url is None:
+        os.environ.pop("OPENAI_BASE_URL", None)
+    else:
+        os.environ["OPENAI_BASE_URL"] = prev_openai_base_url
+
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture(
+    scope="module",
+)
+def client(request, mock_openai_server):
     # Get URL from environment or start server
     api_url = os.getenv("LETTA_API_URL")
     server_url = os.getenv("LETTA_SERVER_URL", f"http://localhost:{SERVER_PORT}")
@@ -48,7 +158,7 @@ def client(request):
     # Overide the base_url if the LETTA_API_URL is set
     base_url = api_url if api_url else server_url
     # create the Letta client
-    yield Letta(base_url=base_url, token=None)
+    yield Letta(base_url=base_url)
 
 
 # Fixture for test agent
@@ -57,8 +167,8 @@ def agent(client: Letta):
     agent_state = client.agents.create(
         name="test_client",
         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     yield agent_state
@@ -73,8 +183,8 @@ def search_agent_one(client: Letta):
     agent_state = client.agents.create(
         name="Search Agent One",
         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     yield agent_state
@@ -89,8 +199,8 @@ def search_agent_two(client: Letta):
     agent_state = client.agents.create(
         name="Search Agent Two",
         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     yield agent_state
@@ -123,35 +233,39 @@ def test_add_and_manage_tags_for_agent(client: Letta):
     tags_to_add = ["test_tag_1", "test_tag_2", "test_tag_3"]
 
     # Step 0: create an agent with no tags
-    agent = client.agents.create(memory_blocks=[], model="letta/letta-free", embedding="letta/letta-free")
+    agent = client.agents.create(
+        memory_blocks=[],
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
+    )
     assert len(agent.tags) == 0
 
     # Step 1: Add multiple tags to the agent
-    client.agents.modify(agent_id=agent.id, tags=tags_to_add)
+    client.agents.update(agent_id=agent.id, tags=tags_to_add)
 
     # Step 2: Retrieve tags for the agent and verify they match the added tags
-    retrieved_tags = client.agents.retrieve(agent_id=agent.id).tags
+    retrieved_tags = client.agents.retrieve(agent_id=agent.id, include=["agent.tags"]).tags
     assert set(retrieved_tags) == set(tags_to_add), f"Expected tags {tags_to_add}, but got {retrieved_tags}"
 
     # Step 3: Retrieve agents by each tag to ensure the agent is associated correctly
     for tag in tags_to_add:
-        agents_with_tag = client.agents.list(tags=[tag])
+        agents_with_tag = client.agents.list(tags=[tag]).items
         assert agent.id in [a.id for a in agents_with_tag], f"Expected agent {agent.id} to be associated with tag '{tag}'"
 
     # Step 4: Delete a specific tag from the agent and verify its removal
     tag_to_delete = tags_to_add.pop()
-    client.agents.modify(agent_id=agent.id, tags=tags_to_add)
+    client.agents.update(agent_id=agent.id, tags=tags_to_add)
 
     # Verify the tag is removed from the agent's tags
-    remaining_tags = client.agents.retrieve(agent_id=agent.id).tags
+    remaining_tags = client.agents.retrieve(agent_id=agent.id, include=["agent.tags"]).tags
     assert tag_to_delete not in remaining_tags, f"Tag '{tag_to_delete}' was not removed as expected"
     assert set(remaining_tags) == set(tags_to_add), f"Expected remaining tags to be {tags_to_add[1:]}, but got {remaining_tags}"
 
     # Step 5: Delete all remaining tags from the agent
-    client.agents.modify(agent_id=agent.id, tags=[])
+    client.agents.update(agent_id=agent.id, tags=[])
 
     # Verify all tags are removed
-    final_tags = client.agents.retrieve(agent_id=agent.id).tags
+    final_tags = client.agents.retrieve(agent_id=agent.id, include=["agent.tags"]).tags
     assert len(final_tags) == 0, f"Expected no tags, but found {final_tags}"
 
     # Remove agent
@@ -165,22 +279,22 @@ def test_agent_tags(client: Letta, clear_tables):
     agent1 = client.agents.create(
         name=f"test_agent_{str(uuid.uuid4())}",
         tags=["test", "agent1", "production"],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     agent2 = client.agents.create(
         name=f"test_agent_{str(uuid.uuid4())}",
         tags=["test", "agent2", "development"],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     agent3 = client.agents.create(
         name=f"test_agent_{str(uuid.uuid4())}",
         tags=["test", "agent3", "production"],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     # Test getting all tags
@@ -230,15 +344,15 @@ def test_shared_blocks(disable_e2b_api_key, client: Letta):
         name="agent1",
         memory_blocks=[{"label": "persona", "value": "you are agent 1"}],
         block_ids=[block.id],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
     agent_state2 = client.agents.create(
         name="agent2",
         memory_blocks=[{"label": "persona", "value": "you are agent 2"}],
         block_ids=[block.id],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
     )
 
     # update memory
@@ -255,18 +369,22 @@ def test_shared_blocks(disable_e2b_api_key, client: Letta):
 def test_update_agent_memory_label(client: Letta):
     """Test that we can update the label of a block in an agent's memory"""
 
-    agent = client.agents.create(model="letta/letta-free", embedding="letta/letta-free", memory_blocks=[{"label": "human", "value": ""}])
+    agent = client.agents.create(
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
+        memory_blocks=[{"label": "human", "value": ""}],
+    )
 
     try:
-        current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id)]
+        current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id).items]
         example_label = current_labels[0]
         example_new_label = "example_new_label"
-        assert example_new_label not in [b.label for b in client.agents.blocks.list(agent_id=agent.id)]
+        assert example_new_label not in [b.label for b in client.agents.blocks.list(agent_id=agent.id).items]
 
-        client.agents.blocks.modify(agent_id=agent.id, block_label=example_label, label=example_new_label)
+        client.agents.blocks.update(agent_id=agent.id, block_label=example_label, label=example_new_label)
 
         updated_blocks = client.agents.blocks.list(agent_id=agent.id)
-        assert example_new_label in [b.label for b in updated_blocks]
+        assert example_new_label in [b.label for b in updated_blocks.items]
 
     finally:
         client.agents.delete(agent.id)
@@ -275,7 +393,7 @@ def test_update_agent_memory_label(client: Letta):
 def test_attach_detach_agent_memory_block(client: Letta, agent: AgentState):
     """Test that we can add and remove a block from an agent's memory"""
 
-    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id)]
+    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id).items]
     example_new_label = current_labels[0] + "_v2"
     example_new_value = "example value"
     assert example_new_label not in current_labels
@@ -290,33 +408,33 @@ def test_attach_detach_agent_memory_block(client: Letta, agent: AgentState):
         agent_id=agent.id,
         block_id=block.id,
     )
-    assert example_new_label in [block.label for block in client.agents.blocks.list(agent_id=updated_agent.id)]
+    assert example_new_label in [block.label for block in client.agents.blocks.list(agent_id=updated_agent.id).items]
 
     # Now unlink the block
     updated_agent = client.agents.blocks.detach(
         agent_id=agent.id,
         block_id=block.id,
     )
-    assert example_new_label not in [block.label for block in client.agents.blocks.list(agent_id=updated_agent.id)]
+    assert example_new_label not in [block.label for block in client.agents.blocks.list(agent_id=updated_agent.id).items]
 
 
 def test_update_agent_memory_limit(client: Letta):
     """Test that we can update the limit of a block in an agent's memory"""
 
     agent = client.agents.create(
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
         memory_blocks=[
             {"label": "human", "value": "username: sarah", "limit": 1000},
             {"label": "persona", "value": "you are sarah", "limit": 1000},
         ],
     )
 
-    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id)]
+    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id).items]
     example_label = current_labels[0]
     example_new_limit = 1
 
-    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id)]
+    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id).items]
     example_label = current_labels[0]
     example_new_limit = 1
     current_block = client.agents.blocks.retrieve(agent_id=agent.id, block_label=example_label)
@@ -326,8 +444,8 @@ def test_update_agent_memory_limit(client: Letta):
     assert example_new_limit < current_block_length
 
     # We expect this to throw a value error
-    with pytest.raises(ApiError):
-        client.agents.blocks.modify(
+    with pytest.raises(APIError):
+        client.agents.blocks.update(
             agent_id=agent.id,
             block_label=example_label,
             limit=example_new_limit,
@@ -336,7 +454,7 @@ def test_update_agent_memory_limit(client: Letta):
     # Now try the same thing with a higher limit
     example_new_limit = current_block_length + 10000
     assert example_new_limit > current_block_length
-    client.agents.blocks.modify(
+    client.agents.blocks.update(
         agent_id=agent.id,
         block_label=example_label,
         limit=example_new_limit,
@@ -363,8 +481,8 @@ def test_function_always_error(client: Letta):
 
     tool = client.tools.upsert_from_function(func=testing_method)
     agent = client.agents.create(
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
         memory_blocks=[
             {
                 "label": "human",
@@ -381,7 +499,7 @@ def test_function_always_error(client: Letta):
     # get function response
     response = client.agents.messages.create(
         agent_id=agent.id,
-        messages=[MessageCreate(role="user", content="call the testing_method function and tell me the result")],
+        messages=[MessageCreateParam(role="user", content="call the testing_method function and tell me the result")],
     )
     print(response.messages)
 
@@ -420,23 +538,25 @@ def test_attach_detach_agent_tool(client: Letta, agent: AgentState):
         tool = client.tools.upsert_from_function(func=example_tool)
 
         # Initially tool should not be attached
-        initial_tools = client.agents.tools.list(agent_id=agent.id)
+        initial_tools = client.agents.tools.list(agent_id=agent.id).items
         assert tool.id not in [t.id for t in initial_tools]
 
         # Attach tool
-        new_agent_state = client.agents.tools.attach(agent_id=agent.id, tool_id=tool.id)
+        client.agents.tools.attach(agent_id=agent.id, tool_id=tool.id)
+        new_agent_state = client.agents.retrieve(agent_id=agent.id, include=["agent.tools"])
         assert tool.id in [t.id for t in new_agent_state.tools]
 
         # Verify tool is attached
-        updated_tools = client.agents.tools.list(agent_id=agent.id)
+        updated_tools = client.agents.tools.list(agent_id=agent.id).items
         assert tool.id in [t.id for t in updated_tools]
 
         # Detach tool
-        new_agent_state = client.agents.tools.detach(agent_id=agent.id, tool_id=tool.id)
+        client.agents.tools.detach(agent_id=agent.id, tool_id=tool.id)
+        new_agent_state = client.agents.retrieve(agent_id=agent.id, include=["agent.tools"])
         assert tool.id not in [t.id for t in new_agent_state.tools]
 
         # Verify tool is detached
-        final_tools = client.agents.tools.list(agent_id=agent.id)
+        final_tools = client.agents.tools.list(agent_id=agent.id).items
         assert tool.id not in [t.id for t in final_tools]
 
     finally:
@@ -449,11 +569,19 @@ def test_attach_detach_agent_tool(client: Letta, agent: AgentState):
 def test_messages(client: Letta, agent: AgentState):
     # _reset_config()
 
-    send_message_response = client.agents.messages.create(agent_id=agent.id, messages=[MessageCreate(role="user", content="Test message")])
+    send_message_response = client.agents.messages.create(
+        agent_id=agent.id, messages=[MessageCreateParam(role="user", content="Test message")]
+    )
     assert send_message_response, "Sending message failed"
 
-    messages_response = client.agents.messages.list(agent_id=agent.id, limit=1)
+    messages_response = client.agents.messages.list(agent_id=agent.id, limit=1).items
     assert len(messages_response) > 0, "Retrieving messages failed"
+
+    # search_response = list(client.messages.search(query="test"))
+    # assert len(search_response) > 0, "Searching messages failed"
+    # for result in search_response:
+    #    assert result.agent_id == agent.id
+    #    assert result.created_at
 
 
 # TODO: Add back when new agent loop hits
@@ -466,7 +594,7 @@ def test_messages(client: Letta, agent: AgentState):
 #     # Define a coroutine for sending a message using asyncio.to_thread for synchronous calls
 #     async def send_message_task(message: str):
 #         response = await asyncio.to_thread(
-#             client.agents.messages.create, agent_id=agent.id, messages=[MessageCreate(role="user", content=message)]
+#             client.agents.messages.create, agent_id=agent.id, messages=[MessageCreateParam(role="user", content=message)]
 #         )
 #         assert response, f"Sending message '{message}' failed"
 #         return response
@@ -497,23 +625,23 @@ def test_messages(client: Letta, agent: AgentState):
 def test_agent_listing(client: Letta, agent, search_agent_one, search_agent_two):
     """Test listing agents with pagination and query text filtering."""
     # Test query text filtering
-    search_results = client.agents.list(query_text="search agent")
+    search_results = client.agents.list(query_text="search agent").items
     assert len(search_results) == 2
     search_agent_ids = {agent.id for agent in search_results}
     assert search_agent_one.id in search_agent_ids
     assert search_agent_two.id in search_agent_ids
     assert agent.id not in search_agent_ids
 
-    different_results = client.agents.list(query_text="client")
+    different_results = client.agents.list(query_text="client").items
     assert len(different_results) == 1
     assert different_results[0].id == agent.id
 
     # Test pagination
-    first_page = client.agents.list(query_text="search agent", limit=1)
+    first_page = client.agents.list(query_text="search agent", limit=1).items
     assert len(first_page) == 1
     first_agent = first_page[0]
 
-    second_page = client.agents.list(query_text="search agent", after=first_agent.id, limit=1)  # Use agent ID as cursor
+    second_page = client.agents.list(query_text="search agent", after=first_agent.id, limit=1).items  # Use agent ID as cursor
     assert len(second_page) == 1
     assert second_page[0].id != first_agent.id
 
@@ -523,7 +651,7 @@ def test_agent_listing(client: Letta, agent, search_agent_one, search_agent_two)
     assert all_ids == {search_agent_one.id, search_agent_two.id}
 
     # Test listing without any filters; make less flakey by checking we have at least 3 agents in case created elsewhere
-    all_agents = client.agents.list()
+    all_agents = client.agents.list().items
     assert len(all_agents) >= 3
     assert all(agent.id in {a.id for a in all_agents} for agent in [search_agent_one, search_agent_two, agent])
 
@@ -555,8 +683,8 @@ def test_agent_creation(client: Letta):
             },
             {"label": "persona", "value": "you are an assistant"},
         ],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
         tool_ids=[tool1.id, tool2.id],
         include_base_tools=False,
         tags=["test"],
@@ -569,7 +697,7 @@ def test_agent_creation(client: Letta):
     assert agent.id is not None
 
     # Verify the blocks are properly attached
-    agent_blocks = client.agents.blocks.list(agent_id=agent.id)
+    agent_blocks = client.agents.blocks.list(agent_id=agent.id).items
     agent_block_ids = {block.id for block in agent_blocks}
 
     # Check that all memory blocks are present
@@ -579,7 +707,7 @@ def test_agent_creation(client: Letta):
     assert user_preferences_block.id in agent_block_ids, f"User preferences block {user_preferences_block.id} not attached to agent"
 
     # Verify the tools are properly attached
-    agent_tools = client.agents.tools.list(agent_id=agent.id)
+    agent_tools = client.agents.tools.list(agent_id=agent.id).items
     assert len(agent_tools) == 2
     tool_ids = {tool1.id, tool2.id}
     assert all(tool.id in tool_ids for tool in agent_tools)
@@ -594,23 +722,23 @@ def test_initial_sequence(client: Letta):
     # create an agent
     agent = client.agents.create(
         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
         initial_message_sequence=[
-            MessageCreate(
+            MessageCreateParam(
                 role="assistant",
                 content="Hello, how are you?",
             ),
-            MessageCreate(role="user", content="I'm good, and you?"),
+            MessageCreateParam(role="user", content="I'm good, and you?"),
         ],
     )
 
     # list messages
-    messages = client.agents.messages.list(agent_id=agent.id)
+    messages = client.agents.messages.list(agent_id=agent.id).items
     response = client.agents.messages.create(
         agent_id=agent.id,
         messages=[
-            MessageCreate(
+            MessageCreateParam(
                 role="user",
                 content="hello assistant!",
             )
@@ -626,8 +754,8 @@ def test_initial_sequence(client: Letta):
 # def test_timezone(client: Letta):
 #     agent = client.agents.create(
 #         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-#         model="letta/letta-free",
-#         embedding="letta/letta-free",
+#         model="anthropic/claude-haiku-4-5-20251001",
+#         embedding="openai/text-embedding-3-small",
 #         timezone="America/Los_Angeles",
 #     )
 #
@@ -637,7 +765,7 @@ def test_initial_sequence(client: Letta):
 #     response = client.agents.messages.create(
 #         agent_id=agent.id,
 #         messages=[
-#             MessageCreate(
+#             MessageCreateParam(
 #                 role="user",
 #                 content="What timezone are you in?",
 #             )
@@ -653,7 +781,7 @@ def test_initial_sequence(client: Letta):
 #     )
 #
 #     # test updating the timezone
-#     client.agents.modify(agent_id=agent.id, timezone="America/New_York")
+#     client.agents.update(agent_id=agent.id, timezone="America/New_York")
 #     agent = client.agents.retrieve(agent_id=agent.id)
 #     assert agent.timezone == "America/New_York"
 
@@ -661,8 +789,8 @@ def test_initial_sequence(client: Letta):
 def test_attach_sleeptime_block(client: Letta):
     agent = client.agents.create(
         memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5-20251001",
+        embedding="openai/text-embedding-3-small",
         enable_sleeptime=True,
     )
 
@@ -678,10 +806,10 @@ def test_attach_sleeptime_block(client: Letta):
     client.agents.blocks.attach(agent_id=agent.id, block_id=block.id)
 
     # verify block is attached to both agents
-    blocks = client.agents.blocks.list(agent_id=agent.id)
+    blocks = client.agents.blocks.list(agent_id=agent.id).items
     assert block.id in [b.id for b in blocks]
 
-    blocks = client.agents.blocks.list(agent_id=sleeptime_id)
+    blocks = client.agents.blocks.list(agent_id=sleeptime_id).items
     assert block.id in [b.id for b in blocks]
 
     # blocks = client.blocks.list(project_id="test")

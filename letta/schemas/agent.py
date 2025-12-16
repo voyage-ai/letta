@@ -24,6 +24,7 @@ from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.tool_rule import ToolRule
+from letta.services.summarizer.summarizer_config import CompactionSettings
 from letta.utils import calculate_file_defaults_based_on_context_window, create_random_username
 
 
@@ -86,6 +87,9 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     model: Optional[str] = Field(None, description="The model handle used by the agent (format: provider/model-name).")
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings used by the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
 
     response_format: Optional[ResponseFormatUnion] = Field(
         None,
@@ -100,7 +104,9 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     memory: Memory = Field(..., description="Deprecated: Use `blocks` field instead. The in-context memory of the agent.", deprecated=True)
     blocks: List[Block] = Field(..., description="The memory blocks used by the agent.")
     tools: List[Tool] = Field(..., description="The tools used by the agent.")
-    sources: List[Source] = Field(..., description="The sources used by the agent.")
+    sources: List[Source] = Field(
+        ..., description="Deprecated: Use `folders` field instead. The sources used by the agent.", deprecated=True
+    )
     tags: List[str] = Field(..., description="The tags associated with the agent.")
     tool_exec_environment_variables: List[AgentEnvironmentVariable] = Field(
         default_factory=list,
@@ -159,10 +165,11 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     )
 
     def get_agent_env_vars_as_dict(self) -> Dict[str, str]:
-        # Get environment variables for this agent specifically
+        # Get environment variables for this agent (value is already decrypted via from_orm_async)
         per_agent_env_vars = {}
         for agent_env_var_obj in self.secrets:
-            per_agent_env_vars[agent_env_var_obj.key] = agent_env_var_obj.value
+            # Use the pre-decrypted value field (populated by from_orm_async)
+            per_agent_env_vars[agent_env_var_obj.key] = agent_env_var_obj.value or ""
         return per_agent_env_vars
 
     @model_validator(mode="after")
@@ -199,12 +206,15 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     # TODO: This is a legacy field and should be removed ASAP to force `tool_ids` usage
     tools: Optional[List[str]] = Field(None, description="The tools used by the agent.")
     tool_ids: Optional[List[str]] = Field(None, description="The ids of the tools used by the agent.")
-    source_ids: Optional[List[str]] = Field(None, description="The ids of the sources used by the agent.")
+    source_ids: Optional[List[str]] = Field(
+        None, description="Deprecated: Use `folder_ids` field instead. The ids of the sources used by the agent.", deprecated=True
+    )
+    folder_ids: Optional[List[str]] = Field(None, description="The ids of the folders used by the agent.")
     block_ids: Optional[List[str]] = Field(None, description="The ids of the blocks used by the agent.")
     tool_rules: Optional[List[ToolRule]] = Field(None, description="The tool rules governing the agent.")
     tags: Optional[List[str]] = Field(None, description="The tags associated with the agent.")
     system: Optional[str] = Field(None, description="The system prompt used by the agent.")
-    agent_type: AgentType = Field(default_factory=lambda: AgentType.memgpt_v2_agent, description="The type of agent.")
+    agent_type: AgentType = Field(default_factory=lambda: AgentType.letta_v1_agent, description="The type of agent.")
     # Note: if this is None, then we'll populate with the standard "more human than human" initial message sequence
     # If the client wants to make this empty, then the client can set the arg to an empty list
     initial_message_sequence: Optional[List[MessageCreate]] = Field(
@@ -236,6 +246,9 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings for the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
 
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     embedding_chunk_size: Optional[int] = Field(
@@ -294,7 +307,11 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
-    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
+    response_format: Optional[ResponseFormatUnion] = Field(
+        None,
+        description="Deprecated: Use `model_settings` field to configure response format instead. The response format for the agent.",
+        deprecated=True,
+    )
     timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
     max_files_open: Optional[int] = Field(
         None,
@@ -310,8 +327,8 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         deprecated=True,
     )
     parallel_tool_calls: Optional[bool] = Field(
-        False,
-        description="Deprecated: Use `model` field to configure parallel tool calls instead. If set to True, enables parallel tool calling.",
+        None,
+        description="Deprecated: Use `model_settings` to configure parallel tool calls instead. If set to True, enables parallel tool calling.",
         deprecated=True,
     )
 
@@ -396,7 +413,10 @@ class InternalTemplateAgentCreate(CreateAgent):
 class UpdateAgent(BaseModel):
     name: Optional[str] = Field(None, description="The name of the agent.")
     tool_ids: Optional[List[str]] = Field(None, description="The ids of the tools used by the agent.")
-    source_ids: Optional[List[str]] = Field(None, description="The ids of the sources used by the agent.")
+    source_ids: Optional[List[str]] = Field(
+        None, description="Deprecated: Use `folder_ids` field instead. The ids of the sources used by the agent.", deprecated=True
+    )
+    folder_ids: Optional[List[str]] = Field(None, description="The ids of the folders used by the agent.")
     block_ids: Optional[List[str]] = Field(None, description="The ids of the blocks used by the agent.")
     tags: Optional[List[str]] = Field(None, description="The tags associated with the agent.")
     system: Optional[str] = Field(None, description="The system prompt used by the agent.")
@@ -422,6 +442,10 @@ class UpdateAgent(BaseModel):
     )
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings for the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
+
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     reasoning: Optional[bool] = Field(
         None,
@@ -433,13 +457,13 @@ class UpdateAgent(BaseModel):
     )
     embedding_config: Optional[EmbeddingConfig] = Field(None, description="The embedding configuration used by the agent.")
     parallel_tool_calls: Optional[bool] = Field(
-        False,
-        description="Deprecated: Use `model` field to configure parallel tool calls instead. If set to True, enables parallel tool calling.",
+        None,
+        description="Deprecated: Use `model_settings` to configure parallel tool calls instead. If set to True, enables parallel tool calling.",
         deprecated=True,
     )
     response_format: Optional[ResponseFormatUnion] = Field(
         None,
-        description="Deprecated: Use `model` field to configure response format instead. The response format for the agent.",
+        description="Deprecated: Use `model_settings` field to configure response format instead. The response format for the agent.",
         deprecated=True,
     )
     max_tokens: Optional[int] = Field(

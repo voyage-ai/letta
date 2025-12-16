@@ -1,6 +1,7 @@
 import importlib
 from typing import List, Optional, Set, Union
 
+from pydantic import ValidationError
 from sqlalchemy import and_, func, or_, select
 
 from letta.constants import (
@@ -18,7 +19,9 @@ from letta.constants import (
     LOCAL_ONLY_MULTI_AGENT_TOOLS,
     MAX_TOOL_NAME_LENGTH,
     MCP_TOOL_TAG_NAME_PREFIX,
+    MODAL_DEFAULT_PYTHON_VERSION,
     MODAL_DEFAULT_TOOL_NAME,
+    MODAL_SAFE_IMPORT_MODULES,
 )
 from letta.errors import LettaInvalidArgumentError, LettaToolNameConflictError, LettaToolNameSchemaMismatchError
 from letta.functions.functions import derive_openai_json_schema, load_function_set
@@ -28,7 +31,7 @@ from letta.log import get_logger
 # TODO: Remove this once we translate all of these to the ORM
 from letta.orm.errors import NoResultFound
 from letta.orm.tool import Tool as ToolModel
-from letta.otel.tracing import trace_method
+from letta.otel.tracing import trace_method, tracer
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import PrimitiveType, SandboxType, ToolType
 from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
@@ -38,7 +41,7 @@ from letta.services.helpers.agent_manager_helper import calculate_multi_agent_to
 from letta.services.mcp.types import SSEServerConfig, StdioServerConfig
 from letta.services.tool_schema_generator import generate_schema_for_tool_creation, generate_schema_for_tool_update
 from letta.settings import settings, tool_settings
-from letta.utils import enforce_types, printd
+from letta.utils import enforce_types, fire_and_forget, printd
 from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
@@ -57,7 +60,9 @@ def modal_tool_wrapper(tool: PydanticTool, actor: PydanticUser, sandbox_env_vars
     from letta_client import Letta
 
     packages = [str(req) for req in tool.pip_requirements] if tool.pip_requirements else []
-    packages.append("letta_client")
+    for package in MODAL_SAFE_IMPORT_MODULES:
+        packages.append(package)
+    packages.append("letta_client>=1.1.1")
     packages.append("letta")  # Base letta without extras
     packages.append("asyncpg>=0.30.0")  # Fixes asyncpg import error
     packages.append("psycopg2-binary>=2.9.10")  # PostgreSQL adapter (pre-compiled, no build required)
@@ -73,7 +78,7 @@ def modal_tool_wrapper(tool: PydanticTool, actor: PydanticUser, sandbox_env_vars
         secrets_dict.update(sandbox_env_vars)
 
     @modal_app.function(
-        image=modal.Image.debian_slim(python_version="3.13").pip_install(packages),
+        image=modal.Image.debian_slim(python_version=MODAL_DEFAULT_PYTHON_VERSION).pip_install(packages),
         restrict_modal_access=True,
         timeout=10,
         secrets=[modal.Secret.from_dict(secrets_dict)],
@@ -112,22 +117,23 @@ def modal_tool_wrapper(tool: PydanticTool, actor: PydanticUser, sandbox_env_vars
                 print("Passing agent_state as dict to tool", file=sys.stderr)
                 reconstructed_agent_state = agent_state
 
-        # Set environment variables
         if env_vars:
             for key, value in env_vars.items():
                 os.environ[key] = str(value)
 
+        # TODO: directly instantiate the letta client once we upgrade to 1.0.0+ in core
         # Initialize the Letta client
-        if letta_api_key:
-            letta_client = Letta(token=letta_api_key, base_url=os.environ.get("LETTA_API_URL", "https://api.letta.com"))
-        else:
-            letta_client = None
+        # if letta_api_key:
+        #     letta_client = Letta(token=letta_api_key, base_url=os.environ.get("LETTA_API_URL", "https://api.letta.com"))
+        # else:
+        #     letta_client = None
 
         tool_namespace = {
             "__builtins__": __builtins__,  # Include built-in functions
-            "_letta_client": letta_client,  # Make letta_client available
+            # "_letta_client": letta_client,  # Make letta_client available
             "os": os,  # Include os module for env vars access
             "agent_id": agent_id,
+            "_LETTA_API_KEY": letta_api_key,
             # Add any other modules/variables the tool might need
         }
 
@@ -192,11 +198,16 @@ class ToolManager:
     @enforce_types
     @trace_method
     async def create_or_update_tool_async(
-        self, pydantic_tool: PydanticTool, actor: PydanticUser, bypass_name_check: bool = False
+        self, pydantic_tool: PydanticTool, actor: PydanticUser, bypass_name_check: bool = False, modal_sandbox_enabled: bool = False
     ) -> PydanticTool:
-        """Create a new tool based on the ToolCreate schema."""
+        """Create a new tool based on the ToolCreate schema.
+
+        Uses atomic PostgreSQL ON CONFLICT DO UPDATE to prevent race conditions
+        during concurrent upserts.
+        """
         if pydantic_tool.tool_type == ToolType.CUSTOM and not pydantic_tool.json_schema:
-            generated_schema = generate_schema_for_tool_creation(pydantic_tool)
+            with tracer.start_as_current_span("generate_schema_for_tool_creation"):
+                generated_schema = generate_schema_for_tool_creation(pydantic_tool)
             if generated_schema:
                 pydantic_tool.json_schema = generated_schema
             else:
@@ -219,31 +230,133 @@ class ToolManager:
                     source_code=pydantic_tool.source_code,
                 )
 
-        # check if the tool name already exists
+        # Use atomic PostgreSQL upsert if available
+        if settings.letta_pg_uri_no_default:
+            return await self._atomic_upsert_tool_postgresql(pydantic_tool, actor, modal_sandbox_enabled)
+
+        # Fallback for SQLite: use non-atomic check-then-act pattern
         current_tool = await self.get_tool_by_name_async(tool_name=pydantic_tool.name, actor=actor)
+
         if current_tool:
             # Put to dict and remove fields that should not be reset
             update_data = pydantic_tool.model_dump(exclude_unset=True, exclude_none=True)
-            update_data["organization_id"] = actor.organization_id
 
-            # If there's anything to update
-            if update_data:
+            # Check if any field in update_data actually differs from the current tool
+            current_tool_data = current_tool.model_dump()
+            needs_update = any(current_tool_data.get(key) != value for key, value in update_data.items())
+
+            if needs_update:
                 # In case we want to update the tool type
                 # Useful if we are shuffling around base tools
                 updated_tool_type = None
                 if "tool_type" in update_data:
                     updated_tool_type = update_data.get("tool_type")
+
+                tool_update = ToolUpdate(**update_data)
                 tool = await self.update_tool_by_id_async(
-                    current_tool.id, ToolUpdate(**update_data), actor, updated_tool_type=updated_tool_type
+                    current_tool.id,
+                    tool_update,
+                    actor,
+                    updated_tool_type=updated_tool_type,
+                    modal_sandbox_enabled=modal_sandbox_enabled,
                 )
             else:
                 printd(
                     f"`create_or_update_tool` was called with user_id={actor.id}, organization_id={actor.organization_id}, name={pydantic_tool.name}, but found existing tool with nothing to update."
                 )
-                tool = await self.get_tool_by_id_async(current_tool.id, actor=actor)
+                return current_tool
             return tool
 
-        return await self.create_tool_async(pydantic_tool, actor=actor)
+        return await self.create_tool_async(pydantic_tool, actor=actor, modal_sandbox_enabled=modal_sandbox_enabled)
+
+    @enforce_types
+    @trace_method
+    async def _atomic_upsert_tool_postgresql(
+        self, pydantic_tool: PydanticTool, actor: PydanticUser, modal_sandbox_enabled: bool = False
+    ) -> PydanticTool:
+        """Atomically upsert a single tool using PostgreSQL's ON CONFLICT DO UPDATE.
+
+        This prevents race conditions when multiple concurrent requests try to
+        create/update the same tool by name.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        # Auto-generate description if not provided
+        if pydantic_tool.description is None and pydantic_tool.json_schema:
+            pydantic_tool.description = pydantic_tool.json_schema.get("description", None)
+
+        # Add sandbox:modal to metadata if flag is enabled
+        if modal_sandbox_enabled:
+            if pydantic_tool.metadata_ is None:
+                pydantic_tool.metadata_ = {}
+            pydantic_tool.metadata_["sandbox"] = "modal"
+
+        # Add tool hash to metadata for Modal deployment tracking
+        tool_hash = compute_tool_hash(pydantic_tool)
+        if pydantic_tool.metadata_ is None:
+            pydantic_tool.metadata_ = {}
+        pydantic_tool.metadata_["tool_hash"] = tool_hash
+
+        async with db_registry.async_session() as session:
+            table = ToolModel.__table__
+            valid_columns = {col.name for col in table.columns}
+
+            tool_dict = pydantic_tool.model_dump(to_orm=True)
+            tool_dict["_created_by_id"] = actor.id
+            tool_dict["_last_updated_by_id"] = actor.id
+            tool_dict["organization_id"] = actor.organization_id
+
+            # Filter to only include columns that exist in the table
+            # Also exclude None values to let database defaults apply
+            insert_data = {k: v for k, v in tool_dict.items() if k in valid_columns and v is not None}
+
+            # Build the INSERT ... ON CONFLICT DO UPDATE statement
+            stmt = pg_insert(table).values(**insert_data)
+
+            # On conflict, update all columns except id, created_at, and _created_by_id
+            excluded = stmt.excluded
+            update_dict = {}
+            for col in table.columns:
+                if col.name not in ("id", "created_at", "_created_by_id"):
+                    if col.name == "updated_at":
+                        update_dict[col.name] = func.now()
+                    elif col.name == "tags" and (insert_data["tags"] is None or len(insert_data["tags"]) == 0):
+                        # TODO: intentional bug to avoid overriding with empty tags on every upsert
+                        # means you cannot clear tags, only override them
+                        if insert_data["tags"] is None or len(insert_data["tags"]) == 0:
+                            continue
+                        update_dict[col.name] = excluded[col.name]
+                    else:
+                        update_dict[col.name] = excluded[col.name]
+
+            upsert_stmt = stmt.on_conflict_do_update(index_elements=["name", "organization_id"], set_=update_dict).returning(table.c.id)
+
+            result = await session.execute(upsert_stmt)
+            tool_id = result.scalar_one()
+            await session.commit()
+
+            # Fetch the upserted tool
+            tool = await ToolModel.read_async(db_session=session, identifier=tool_id, actor=actor)
+            upserted_tool = tool.to_pydantic()
+
+        # Deploy Modal app if needed (both Modal credentials configured AND tool metadata must indicate Modal)
+        # TODO: dont have such duplicated code
+        tool_requests_modal = upserted_tool.metadata_ and upserted_tool.metadata_.get("sandbox") == "modal"
+        modal_configured = tool_settings.modal_sandbox_enabled
+
+        if upserted_tool.tool_type == ToolType.CUSTOM and tool_requests_modal and modal_configured:
+            await self.create_or_update_modal_app(upserted_tool, actor)
+
+        # Embed tool in Turbopuffer if enabled
+        from letta.helpers.tpuf_client import should_use_tpuf_for_tools
+
+        if should_use_tpuf_for_tools():
+            fire_and_forget(
+                self._embed_tool_background(upserted_tool, actor),
+                task_name=f"embed_tool_{upserted_tool.id}",
+            )
+
+        return upserted_tool
 
     @enforce_types
     async def create_mcp_server(
@@ -278,7 +391,9 @@ class ToolManager:
 
     @enforce_types
     @trace_method
-    async def create_tool_async(self, pydantic_tool: PydanticTool, actor: PydanticUser) -> PydanticTool:
+    async def create_tool_async(
+        self, pydantic_tool: PydanticTool, actor: PydanticUser, modal_sandbox_enabled: bool = False
+    ) -> PydanticTool:
         """Create a new tool based on the ToolCreate schema."""
         # Generate schema only if not provided (only for custom tools)
 
@@ -286,6 +401,12 @@ class ToolManager:
             # Auto-generate description if not provided
             if pydantic_tool.description is None and pydantic_tool.json_schema:
                 pydantic_tool.description = pydantic_tool.json_schema.get("description", None)
+
+            # Add sandbox:modal to metadata if flag is enabled
+            if modal_sandbox_enabled:
+                if pydantic_tool.metadata_ is None:
+                    pydantic_tool.metadata_ = {}
+                pydantic_tool.metadata_["sandbox"] = "modal"
 
             # Add tool hash to metadata for Modal deployment tracking
             tool_hash = compute_tool_hash(pydantic_tool)
@@ -312,15 +433,25 @@ class ToolManager:
             await tool.create_async(session, actor=actor)  # Re-raise other database-related errors
             created_tool = tool.to_pydantic()
 
-            # Deploy Modal app for the new tool
-            # Both Modal credentials configured AND tool metadata must indicate Modal
-            tool_requests_modal = created_tool.metadata_ and created_tool.metadata_.get("sandbox") == "modal"
-            modal_configured = tool_settings.modal_sandbox_enabled
+        # TODO: dont have such duplicated code
+        # Deploy Modal app for the new tool
+        # Both Modal credentials configured AND tool metadata must indicate Modal
+        tool_requests_modal = created_tool.metadata_ and created_tool.metadata_.get("sandbox") == "modal"
+        modal_configured = tool_settings.modal_sandbox_enabled
 
-            if created_tool.tool_type == ToolType.CUSTOM and tool_requests_modal and modal_configured:
-                await self.create_or_update_modal_app(created_tool, actor)
+        if created_tool.tool_type == ToolType.CUSTOM and tool_requests_modal and modal_configured:
+            await self.create_or_update_modal_app(created_tool, actor)
 
-            return created_tool
+        # Embed tool in Turbopuffer if enabled
+        from letta.helpers.tpuf_client import should_use_tpuf_for_tools
+
+        if should_use_tpuf_for_tools():
+            fire_and_forget(
+                self._embed_tool_background(created_tool, actor),
+                task_name=f"embed_tool_{created_tool.id}",
+            )
+
+        return created_tool
 
     @enforce_types
     @trace_method
@@ -384,8 +515,8 @@ class ToolManager:
             return await self._upsert_tools_individually(pydantic_tools, actor, override_existing_tools)
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
+    @trace_method
     async def get_tool_by_id_async(self, tool_id: str, actor: PydanticUser) -> PydanticTool:
         """Fetch a tool by its ID."""
         async with db_registry.async_session() as session:
@@ -417,8 +548,8 @@ class ToolManager:
             return None
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
+    @trace_method
     async def tool_exists_async(self, tool_id: str, actor: PydanticUser) -> bool:
         """Check if a tool exists and belongs to the user's organization (lightweight check)."""
         async with db_registry.async_session() as session:
@@ -438,6 +569,37 @@ class ToolManager:
             return count > 0
 
     @enforce_types
+    async def _check_tool_name_conflict_with_lock_async(self, session, tool_name: str, exclude_tool_id: str, actor: PydanticUser) -> bool:
+        """Check if a tool with the given name exists (excluding the current tool), with row locking.
+
+        Uses SELECT FOR UPDATE to prevent race conditions when two concurrent updates
+        try to rename tools to the same name.
+
+        Args:
+            session: The database session (must be part of an active transaction)
+            tool_name: The name to check for conflicts
+            exclude_tool_id: The ID of the current tool being updated (to exclude from check)
+            actor: The user performing the action
+
+        Returns:
+            True if a conflicting tool exists, False otherwise
+        """
+        # Use SELECT FOR UPDATE to lock any existing row with this name
+        # This prevents another concurrent transaction from also checking and then updating
+        query = (
+            select(ToolModel.id)
+            .where(
+                ToolModel.name == tool_name,
+                ToolModel.organization_id == actor.organization_id,
+                ToolModel.id != exclude_tool_id,
+            )
+            .with_for_update(nowait=False)  # Wait for lock if another transaction holds it
+        )
+        result = await session.execute(query)
+        existing_tool = result.scalar()
+        return existing_tool is not None
+
+    @enforce_types
     @trace_method
     async def list_tools_async(
         self,
@@ -453,6 +615,7 @@ class ToolManager:
         tool_ids: Optional[List[str]] = None,
         search: Optional[str] = None,
         return_only_letta_tools: bool = False,
+        project_id: Optional[str] = None,
     ) -> List[PydanticTool]:
         """List all tools with pagination support."""
         tools = await self._list_tools_async(
@@ -467,6 +630,7 @@ class ToolManager:
             tool_ids=tool_ids,
             search=search,
             return_only_letta_tools=return_only_letta_tools,
+            project_id=project_id,
         )
 
         # Check if all base tools are present if we requested all the tools w/o cursor
@@ -474,7 +638,7 @@ class ToolManager:
         # TODO: This requires a deeper rethink about how we keep all our internal tools up-to-date
         if not after and upsert_base_tools:
             existing_tool_names = {tool.name for tool in tools}
-            base_tool_names = LETTA_TOOL_SET - set(LOCAL_ONLY_MULTI_AGENT_TOOLS) if settings.environment == "PRODUCTION" else LETTA_TOOL_SET
+            base_tool_names = LETTA_TOOL_SET - set(LOCAL_ONLY_MULTI_AGENT_TOOLS) if settings.environment == "prod" else LETTA_TOOL_SET
             missing_base_tools = base_tool_names - existing_tool_names
 
             # If any base tools are missing, upsert all base tools
@@ -494,6 +658,7 @@ class ToolManager:
                     tool_ids=tool_ids,
                     search=search,
                     return_only_letta_tools=return_only_letta_tools,
+                    project_id=project_id,
                 )
 
         return tools
@@ -513,6 +678,7 @@ class ToolManager:
         tool_ids: Optional[List[str]] = None,
         search: Optional[str] = None,
         return_only_letta_tools: bool = False,
+        project_id: Optional[str] = None,
     ) -> List[PydanticTool]:
         """List all tools with optional pagination."""
         tools_to_delete = []
@@ -520,6 +686,10 @@ class ToolManager:
             # Use SQLAlchemy directly for all cases - more control and consistency
             # Start with base query
             query = select(ToolModel).where(ToolModel.organization_id == actor.organization_id)
+
+            # Apply project_id filter - include tools where project_id matches OR project_id is None (global tools)
+            if project_id is not None:
+                query = query.where(or_(ToolModel.project_id == project_id, ToolModel.project_id.is_(None)))
 
             # Apply tool_types filter
             if tool_types is not None:
@@ -629,12 +799,17 @@ class ToolManager:
         search: Optional[str] = None,
         return_only_letta_tools: bool = False,
         exclude_letta_tools: bool = False,
+        project_id: Optional[str] = None,
     ) -> int:
         """Count tools with the same filtering logic as list_tools_async."""
         async with db_registry.async_session() as session:
             # Use SQLAlchemy directly with COUNT query - same filtering logic as list_tools_async
             # Start with base query
             query = select(func.count(ToolModel.id)).where(ToolModel.organization_id == actor.organization_id)
+
+            # Apply project_id filter - include tools where project_id matches OR project_id is None (global tools)
+            if project_id is not None:
+                query = query.where(or_(ToolModel.project_id == project_id, ToolModel.project_id.is_(None)))
 
             # Apply tool_types filter
             if tool_types is not None:
@@ -690,8 +865,8 @@ class ToolManager:
             return await ToolModel.size_async(db_session=session, actor=actor, name=LETTA_TOOL_SET)
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="tool_id", expected_prefix=PrimitiveType.TOOL)
+    @trace_method
     async def update_tool_by_id_async(
         self,
         tool_id: str,
@@ -699,6 +874,7 @@ class ToolManager:
         actor: PydanticUser,
         updated_tool_type: Optional[ToolType] = None,
         bypass_name_check: bool = False,
+        modal_sandbox_enabled: bool = False,
     ) -> PydanticTool:
         """Update a tool by its ID with the given ToolUpdate object."""
         # Fetch current tool early to allow conditional logic based on tool type
@@ -752,11 +928,8 @@ class ToolManager:
             #    f"JSON schema name '{new_name}' conflicts with current tool name '{current_tool.name}'. Update the name field explicitly if you want to rename the tool."
             # )
 
-        # If name changes, enforce uniqueness
-        if new_name != current_tool.name:
-            name_exists = await self.tool_name_exists_async(tool_name=new_name, actor=actor)
-            if name_exists:
-                raise LettaToolNameConflictError(tool_name=new_name)
+        # Track if we need to check name uniqueness (check is done inside session with lock)
+        needs_name_conflict_check = new_name != current_tool.name
 
         # NOTE: EXTREMELEY HACKY, we need to stop making assumptions about the source_code
         if "source_code" in update_data and f"def {new_name}" not in update_data.get("source_code", ""):
@@ -777,6 +950,26 @@ class ToolManager:
         if updated_tool_type:
             updated_tool_pydantic.tool_type = updated_tool_type
 
+        # Handle sandbox:modal metadata based on flag
+        if modal_sandbox_enabled:
+            # Add sandbox:modal to metadata if flag is enabled
+            if updated_tool_pydantic.metadata_ is None:
+                updated_tool_pydantic.metadata_ = {}
+            updated_tool_pydantic.metadata_["sandbox"] = "modal"
+            # Update the update_data to reflect this change if metadata was in the update
+            if "metadata_" not in update_data:
+                update_data["metadata_"] = updated_tool_pydantic.metadata_
+            else:
+                update_data["metadata_"]["sandbox"] = "modal"
+        else:
+            # Remove sandbox:modal from metadata if flag is not enabled
+            if updated_tool_pydantic.metadata_ and updated_tool_pydantic.metadata_.get("sandbox") == "modal":
+                updated_tool_pydantic.metadata_ = {k: v for k, v in updated_tool_pydantic.metadata_.items() if k != "sandbox"}
+                if not updated_tool_pydantic.metadata_:  # If metadata becomes empty, set to None
+                    updated_tool_pydantic.metadata_ = None
+                # Update the update_data to reflect this change
+                update_data["metadata_"] = updated_tool_pydantic.metadata_
+
         # Check if we need to redeploy the Modal app due to changes
         # Compute this before the session to avoid issues
         tool_requests_modal = updated_tool_pydantic.metadata_ and updated_tool_pydantic.metadata_.get("sandbox") == "modal"
@@ -795,6 +988,18 @@ class ToolManager:
 
         # Now perform the update within the session
         async with db_registry.async_session() as session:
+            # Check name uniqueness with lock INSIDE the session to prevent race conditions
+            # This uses SELECT FOR UPDATE to ensure no other transaction can rename to this name
+            if needs_name_conflict_check:
+                name_conflict = await self._check_tool_name_conflict_with_lock_async(
+                    session=session,
+                    tool_name=new_name,
+                    exclude_tool_id=tool_id,
+                    actor=actor,
+                )
+                if name_conflict:
+                    raise LettaToolNameConflictError(tool_name=new_name)
+
             # Fetch the tool by ID
             tool = await ToolModel.read_async(db_session=session, identifier=tool_id, actor=actor)
 
@@ -830,17 +1035,74 @@ class ToolManager:
             logger.info(f"Deploying Modal app for tool {updated_tool.id} with new hash: {new_hash}")
             await self.create_or_update_modal_app(updated_tool, actor)
 
+        # Update embedding in Turbopuffer if enabled (delete old, insert new)
+        from letta.helpers.tpuf_client import should_use_tpuf_for_tools
+
+        if should_use_tpuf_for_tools():
+
+            async def update_tool_embedding():
+                try:
+                    from letta.helpers.tpuf_client import TurbopufferClient
+
+                    tpuf_client = TurbopufferClient()
+                    # Delete old and re-insert (simpler than update)
+                    await tpuf_client.delete_tools(actor.organization_id, [updated_tool.id])
+                    await tpuf_client.insert_tools([updated_tool], actor.organization_id, actor)
+                    logger.info(f"Successfully updated tool {updated_tool.id} in Turbopuffer")
+                except Exception as e:
+                    logger.error(f"Failed to update tool {updated_tool.id} in Turbopuffer: {e}")
+
+            fire_and_forget(
+                update_tool_embedding(),
+                task_name=f"update_tool_embedding_{updated_tool.id}",
+            )
+
         return updated_tool
 
     @enforce_types
-    @trace_method
     # @raise_on_invalid_id This is commented out bc it's called by _list_tools_async, when it encounters malformed tools (i.e. if id is invalid will fail validation on deletion)
+    @trace_method
     async def delete_tool_by_id_async(self, tool_id: str, actor: PydanticUser) -> None:
         """Delete a tool by its ID."""
         async with db_registry.async_session() as session:
             try:
                 tool = await ToolModel.read_async(db_session=session, identifier=tool_id, actor=actor)
+
+                # Try to convert to Pydantic to check for Modal cleanup
+                # If this fails (corrupted tool), skip Modal cleanup and just delete
+                try:
+                    tool_pydantic = tool.to_pydantic()
+
+                    # Check if tool had Modal deployment and delete it
+                    tool_requests_modal = tool_pydantic.metadata_ and tool_pydantic.metadata_.get("sandbox") == "modal"
+                    modal_configured = tool_settings.modal_sandbox_enabled
+
+                    if tool_pydantic.tool_type == ToolType.CUSTOM and tool_requests_modal and modal_configured:
+                        try:
+                            await self.delete_modal_app(tool_pydantic, actor)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete Modal app for tool {tool_pydantic.name}: {e}")
+                            # Continue with tool deletion even if Modal cleanup fails
+                except (ValueError, ValidationError) as e:
+                    # Tool is corrupted and can't be converted to Pydantic
+                    # Skip Modal cleanup and just delete the tool from database
+                    logger.warning(f"Skipping Modal cleanup for corrupted tool {tool_id}: {e}")
+
                 await tool.hard_delete_async(db_session=session, actor=actor)
+
+                # Delete from Turbopuffer if enabled
+                from letta.helpers.tpuf_client import should_use_tpuf_for_tools
+
+                if should_use_tpuf_for_tools():
+                    try:
+                        from letta.helpers.tpuf_client import TurbopufferClient
+
+                        tpuf_client = TurbopufferClient()
+                        await tpuf_client.delete_tools(actor.organization_id, [tool_id])
+                        logger.info(f"Successfully deleted tool {tool_id} from Turbopuffer")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete tool {tool_id} from Turbopuffer: {e}")
+
             except NoResultFound:
                 raise ValueError(f"Tool with id {tool_id} not found.")
 
@@ -996,7 +1258,6 @@ class ToolManager:
                     tools.append(created_tool)
         return tools
 
-    # MODAL RELATED METHODS
     @trace_method
     async def create_or_update_modal_app(self, tool: PydanticTool, actor: PydanticUser):
         """Create a Modal app with the tool function registered"""
@@ -1025,7 +1286,7 @@ class ToolManager:
         modal_app = modal_tool_wrapper(tool, actor, sandbox_env_vars)
 
         # Deploy the app first
-        with modal.enable_output():
+        with modal.enable_output(show_progress=False):
             try:
                 deploy = modal_app.deploy()
             except Exception as e:
@@ -1041,3 +1302,116 @@ class ToolManager:
             logger.warning(f"Failed to configure autoscaler for Modal function {modal_app.name}: {e}")
 
         return deploy
+
+    async def delete_modal_app(self, tool: PydanticTool, actor: PydanticUser):
+        """Delete a Modal app deployment for the tool"""
+        try:
+            # Generate the app name for this tool
+            modal_app_name = generate_modal_function_name(tool.id, actor.organization_id)
+
+            # Try to delete the app
+            # TODO: we need to soft delete, and then potentially stop via the CLI, no programmatic way to delete currently
+            # try:
+            #     app = modal.App.from_name(modal_app_name)
+            #     await app.delete_async()
+            #     logger.info(f"Deleted Modal app {modal_app_name} for tool {tool.name}")
+            # except modal.exception.NotFoundError:
+            #     logger.info(f"Modal app {modal_app_name} not found, may have been already deleted")
+            # except Exception as e:
+            #     logger.warning(f"Failed to delete Modal app {modal_app_name}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error during Modal app deletion for tool {tool.name}: {e}")
+            raise
+
+    async def _embed_tool_background(
+        self,
+        tool: PydanticTool,
+        actor: PydanticUser,
+    ) -> None:
+        """Background task to embed a tool in Turbopuffer.
+
+        Args:
+            tool: The tool to embed
+            actor: User performing the action
+        """
+        try:
+            from letta.helpers.tpuf_client import TurbopufferClient
+
+            tpuf_client = TurbopufferClient()
+            await tpuf_client.insert_tools(
+                tools=[tool],
+                organization_id=actor.organization_id,
+                actor=actor,
+            )
+            logger.info(f"Successfully embedded tool {tool.id} in Turbopuffer")
+        except Exception as e:
+            logger.error(f"Failed to embed tool {tool.id} in Turbopuffer: {e}")
+
+    @enforce_types
+    @trace_method
+    async def search_tools_async(
+        self,
+        actor: PydanticUser,
+        query_text: Optional[str] = None,
+        search_mode: str = "hybrid",
+        tool_types: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[tuple[PydanticTool, dict]]:
+        """
+        Search tools using Turbopuffer semantic search.
+
+        Args:
+            actor: User performing the search
+            query_text: Text query for semantic search
+            search_mode: "vector", "fts", or "hybrid" (default: "hybrid")
+            tool_types: Optional list of tool types to filter by
+            tags: Optional list of tags to filter by
+            limit: Maximum number of results to return
+
+        Returns:
+            List of (tool, metadata) tuples where metadata contains search scores
+
+        Raises:
+            ValueError: If Turbopuffer is not enabled for tools
+        """
+        from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_tools
+
+        if not should_use_tpuf_for_tools():
+            raise ValueError("Tool semantic search requires tool embedding to be enabled (embed_tools=True).")
+
+        tpuf_client = TurbopufferClient()
+        results = await tpuf_client.query_tools(
+            organization_id=actor.organization_id,
+            actor=actor,
+            query_text=query_text,
+            search_mode=search_mode,
+            top_k=limit,
+            tool_types=tool_types,
+            tags=tags,
+        )
+
+        if not results:
+            return []
+
+        # Fetch full tool objects from database
+        tool_ids = [tool_dict["id"] for tool_dict, _, _ in results]
+        tools = []
+        for tool_id in tool_ids:
+            try:
+                tool = await self.get_tool_by_id_async(tool_id, actor=actor)
+                tools.append(tool)
+            except Exception:
+                pass  # Tool may have been deleted
+
+        tool_map = {tool.id: tool for tool in tools}
+
+        # Build result list preserving order and including metadata
+        result_list = []
+        for tool_dict, _, metadata in results:
+            tool_id = tool_dict["id"]
+            if tool_id in tool_map:
+                result_list.append((tool_map[tool_id], metadata))
+
+        return result_list

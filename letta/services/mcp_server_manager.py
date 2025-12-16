@@ -36,6 +36,7 @@ from letta.schemas.mcp import (
     UpdateStdioMCPServer,
     UpdateStreamableHTTPMCPServer,
 )
+from letta.schemas.mcp_server import CreateMCPServerRequest, CreateSSEMCPServer, CreateStdioMCPServer, CreateStreamableHTTPMCPServer
 from letta.schemas.secret import Secret
 from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
 from letta.schemas.user import User as PydanticUser
@@ -546,6 +547,29 @@ class MCPServerManager:
         return mcp_server
 
     @enforce_types
+    async def create_mcp_server_from_request(self, request: CreateMCPServerRequest, actor: PydanticUser) -> MCPServer:
+        """
+        Create an MCP server from a request object.
+        """
+        # Convert CreateMCPServerUnion to ServerConfig union by adding server_name
+        config_type_map = {
+            CreateStdioMCPServer: StdioServerConfig,
+            CreateSSEMCPServer: SSEServerConfig,
+            CreateStreamableHTTPMCPServer: StreamableHTTPServerConfig,
+        }
+
+        config_dict = request.config.model_dump(exclude={"mcp_server_type"})
+        config_dict["server_name"] = request.server_name
+        config_dict["type"] = request.config.mcp_server_type
+        server_config = config_type_map[type(request.config)](**config_dict)
+
+        # Create the MCP server object (with encryption of sensitive fields)
+        mcp_server = await self.create_mcp_server_from_config(server_config, actor)
+
+        # Persist to database and sync tools
+        return await self.create_mcp_server_with_tools(mcp_server, actor)
+
+    @enforce_types
     async def create_mcp_server_from_config_with_tools(
         self, server_config: Union[StdioServerConfig, SSEServerConfig, StreamableHTTPServerConfig], actor: PydanticUser
     ) -> MCPServer:
@@ -586,31 +610,32 @@ class MCPServerManager:
             # Filter out invalid tools
             valid_tools = [tool for tool in mcp_tools if not (tool.health and tool.health.status == "INVALID")]
 
-            # Register in parallel
+            # Register tools sequentially to avoid exhausting database connection pool
+            # When an MCP server has many tools (e.g., 50+), concurrent tool creation and mapping
+            # can create too many simultaneous database connections, causing pool exhaustion errors
             if valid_tools:
-                tool_tasks = []
+                results = []
+                successful_count = 0
                 for mcp_tool in valid_tools:
                     tool_create = ToolCreate.from_mcp(mcp_server_name=created_server.server_name, mcp_tool=mcp_tool)
-                    task = self.tool_manager.create_mcp_tool_async(
-                        tool_create=tool_create, mcp_server_name=created_server.server_name, mcp_server_id=created_server.id, actor=actor
-                    )
-                    tool_tasks.append(task)
+                    try:
+                        result = await self.tool_manager.create_mcp_tool_async(
+                            tool_create=tool_create,
+                            mcp_server_name=created_server.server_name,
+                            mcp_server_id=created_server.id,
+                            actor=actor,
+                        )
+                        results.append(result)
 
-                results = await asyncio.gather(*tool_tasks, return_exceptions=True)
-
-                # Create mappings in MCPTools table for successful tools
-                mapping_tasks = []
-                successful_count = 0
-                for result in results:
-                    if not isinstance(result, Exception) and result:
-                        # result should be a PydanticTool
-                        mapping_task = self.create_mcp_tool_mapping(created_server.id, result.id, actor)
-                        mapping_tasks.append(mapping_task)
-                        successful_count += 1
-
-                # Execute mapping creation in parallel
-                if mapping_tasks:
-                    await asyncio.gather(*mapping_tasks, return_exceptions=True)
+                        # Create mapping for successful tool
+                        if result:
+                            try:
+                                await self.create_mcp_tool_mapping(created_server.id, result.id, actor)
+                                successful_count += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to create mapping for tool {result.id}: {e}")
+                    except Exception as e:
+                        results.append(e)
 
                 failed = len(results) - successful_count
                 logger.info(
@@ -964,44 +989,26 @@ class MCPServerManager:
     def _oauth_orm_to_pydantic(self, oauth_session: MCPOAuth) -> MCPOAuthSession:
         """
         Convert OAuth ORM model to Pydantic model, handling decryption of sensitive fields.
+
+        Note: Prefers encrypted columns (_enc fields), falls back to plaintext with error logging.
+        This helps identify unmigrated data during the migration period.
         """
-        # Get decrypted values using the dual-read approach
-        # Secret.from_db() will automatically use settings.encryption_key if available
-        access_token = None
-        if oauth_session.access_token_enc or oauth_session.access_token:
-            if settings.encryption_key:
-                secret = Secret.from_db(oauth_session.access_token_enc, oauth_session.access_token)
-                access_token = secret.get_plaintext()
-            else:
-                # No encryption key, use plaintext if available
-                access_token = oauth_session.access_token
+        # Get decrypted values - prefer encrypted, fallback to plaintext with error logging
+        access_token = Secret.from_db(
+            encrypted_value=oauth_session.access_token_enc, plaintext_value=oauth_session.access_token
+        ).get_plaintext()
 
-        refresh_token = None
-        if oauth_session.refresh_token_enc or oauth_session.refresh_token:
-            if settings.encryption_key:
-                secret = Secret.from_db(oauth_session.refresh_token_enc, oauth_session.refresh_token)
-                refresh_token = secret.get_plaintext()
-            else:
-                # No encryption key, use plaintext if available
-                refresh_token = oauth_session.refresh_token
+        refresh_token = Secret.from_db(
+            encrypted_value=oauth_session.refresh_token_enc, plaintext_value=oauth_session.refresh_token
+        ).get_plaintext()
 
-        client_secret = None
-        if oauth_session.client_secret_enc or oauth_session.client_secret:
-            if settings.encryption_key:
-                secret = Secret.from_db(oauth_session.client_secret_enc, oauth_session.client_secret)
-                client_secret = secret.get_plaintext()
-            else:
-                # No encryption key, use plaintext if available
-                client_secret = oauth_session.client_secret
+        client_secret = Secret.from_db(
+            encrypted_value=oauth_session.client_secret_enc, plaintext_value=oauth_session.client_secret
+        ).get_plaintext()
 
-        authorization_code = None
-        if oauth_session.authorization_code_enc or oauth_session.authorization_code:
-            if settings.encryption_key:
-                secret = Secret.from_db(oauth_session.authorization_code_enc, oauth_session.authorization_code)
-                authorization_code = secret.get_plaintext()
-            else:
-                # No encryption key, use plaintext if available
-                authorization_code = oauth_session.authorization_code
+        authorization_code = Secret.from_db(
+            encrypted_value=oauth_session.authorization_code_enc, plaintext_value=oauth_session.authorization_code
+        ).get_plaintext()
 
         # Create the Pydantic object with encrypted fields as Secret objects
         pydantic_session = MCPOAuthSession(

@@ -45,6 +45,7 @@ from letta.schemas.openai.chat_completion_response import (
     ToolCall,
     UsageStatistics,
 )
+from letta.schemas.response_format import JsonSchemaResponseFormat
 from letta.settings import model_settings
 
 DUMMY_FIRST_USER_MESSAGE = "User initializing bootup sequence."
@@ -72,6 +73,18 @@ class AnthropicClient(LLMClientBase):
         except Exception:
             pass
 
+        # Opus 4.5 effort parameter - to extend to other models, modify the model check
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.effort is not None:
+            betas.append("effort-2025-11-24")
+
+        # Context management for Opus 4.5 to preserve thinking blocks (improves cache hits)
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.enable_reasoner:
+            betas.append("context-management-2025-06-27")
+
+        # Structured outputs beta
+        if hasattr(llm_config, "response_format") and isinstance(llm_config.response_format, JsonSchemaResponseFormat):
+            betas.append("structured-outputs-2025-11-13")
+
         if betas:
             response = client.beta.messages.create(**request_data, betas=betas)
         else:
@@ -97,6 +110,18 @@ class AnthropicClient(LLMClientBase):
                 betas.append("context-1m-2025-08-07")
         except Exception:
             pass
+
+        # Opus 4.5 effort parameter - to extend to other models, modify the model check
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.effort is not None:
+            betas.append("effort-2025-11-24")
+
+        # Context management for Opus 4.5 to preserve thinking blocks (improves cache hits)
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.enable_reasoner:
+            betas.append("context-management-2025-06-27")
+
+        # Structured outputs beta
+        if hasattr(llm_config, "response_format") and isinstance(llm_config.response_format, JsonSchemaResponseFormat):
+            betas.append("structured-outputs-2025-11-13")
 
         if betas:
             response = await client.beta.messages.create(**request_data, betas=betas)
@@ -131,7 +156,24 @@ class AnthropicClient(LLMClientBase):
         except Exception:
             pass
 
-        return await client.beta.messages.create(**request_data, betas=betas)
+        # Opus 4.5 effort parameter - to extend to other models, modify the model check
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.effort is not None:
+            betas.append("effort-2025-11-24")
+
+        # Context management for Opus 4.5 to preserve thinking blocks (improves cache hits)
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.enable_reasoner:
+            betas.append("context-management-2025-06-27")
+
+        # Structured outputs beta
+        if hasattr(llm_config, "response_format") and isinstance(llm_config.response_format, JsonSchemaResponseFormat):
+            betas.append("structured-outputs-2025-11-13")
+
+        # log failed requests
+        try:
+            return await client.beta.messages.create(**request_data, betas=betas)
+        except Exception as e:
+            logger.error(f"Error streaming Anthropic request: {e} with request data: {json.dumps(request_data)}")
+            raise e
 
     @trace_method
     async def send_llm_batch_request_async(
@@ -271,6 +313,30 @@ class AnthropicClient(LLMClientBase):
             # Silently disable prefix_fill for now
             prefix_fill = False
 
+        # Effort configuration for Opus 4.5 (controls token spending)
+        # To extend to other models, modify the model check
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.effort is not None:
+            data["output_config"] = {"effort": llm_config.effort}
+
+        # Context management for Opus 4.5 to preserve thinking blocks and improve cache hits
+        # See: https://docs.anthropic.com/en/docs/build-with-claude/context-editing
+        if llm_config.model.startswith("claude-opus-4-5") and llm_config.enable_reasoner:
+            data["context_management"] = {
+                "edits": [
+                    {
+                        "type": "clear_thinking_20251015",
+                        "keep": "all",  # Preserve all thinking blocks for maximum cache performance
+                    }
+                ]
+            }
+
+        # Structured outputs via response_format
+        if hasattr(llm_config, "response_format") and isinstance(llm_config.response_format, JsonSchemaResponseFormat):
+            data["output_format"] = {
+                "type": "json_schema",
+                "schema": llm_config.response_format.json_schema["schema"],
+            }
+
         # Tools
         # For an overview on tool choice:
         # https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview
@@ -320,6 +386,9 @@ class AnthropicClient(LLMClientBase):
         if tools_for_request and len(tools_for_request) > 0:
             # TODO eventually enable parallel tool use
             data["tools"] = convert_tools_to_anthropic_format(tools_for_request)
+            # Add cache control to the last tool for caching tool definitions
+            if len(data["tools"]) > 0:
+                data["tools"][-1]["cache_control"] = {"type": "ephemeral"}
 
         # Messages
         inner_thoughts_xml_tag = "thinking"
@@ -367,6 +436,22 @@ class AnthropicClient(LLMClientBase):
         # Anthropic requires a single result per tool_use. Merging consecutive user messages can accidentally
         # produce multiple tool_result blocks with the same id; consolidate them here.
         data["messages"] = dedupe_tool_results_in_user_messages(data["messages"])
+
+        # Add cache control to final message for incremental conversation caching
+        # Per Anthropic docs: "During each turn, we mark the final block of the final message with
+        # cache_control so the conversation can be incrementally cached."
+        data["messages"] = self._add_cache_control_to_messages(data["messages"])
+
+        # Debug: Log cache control placement
+        logger.debug(f"Anthropic request has {len(data.get('messages', []))} messages")
+        if data.get("messages") and len(data["messages"]) > 0:
+            last_msg = data["messages"][-1]
+            logger.debug(f"Last message role: {last_msg.get('role')}, content type: {type(last_msg.get('content'))}")
+            if isinstance(last_msg.get("content"), list) and len(last_msg["content"]) > 0:
+                last_block = last_msg["content"][-1]
+                logger.debug(f"Last content block type: {last_block.get('type')}, has cache_control: {'cache_control' in last_block}")
+                if "cache_control" in last_block:
+                    logger.debug(f"Cache control value: {last_block['cache_control']}")
 
         # Prefix fill
         # https://docs.anthropic.com/en/api/messages#body-messages
@@ -541,6 +626,17 @@ class AnthropicClient(LLMClientBase):
             except Exception:
                 pass
 
+            # Opus 4.5 beta flags for effort and context management
+            # Note: effort beta is added if model is kevlar (actual effort value is in count_params)
+            # Context management beta is added for consistency with main requests
+            if model and model.startswith("claude-opus-4-5"):
+                # Add effort beta if output_config is present in count_params
+                if "output_config" in count_params:
+                    betas.append("effort-2025-11-24")
+                # Add context management beta if thinking is enabled
+                if thinking_enabled:
+                    betas.append("context-management-2025-06-27")
+
             if betas:
                 result = await client.beta.messages.count_tokens(**count_params, betas=betas)
             else:
@@ -559,6 +655,8 @@ class AnthropicClient(LLMClientBase):
             or llm_config.model.startswith("claude-sonnet-4")
             or llm_config.model.startswith("claude-opus-4")
             or llm_config.model.startswith("claude-haiku-4-5")
+            # Opus 4.5 support - to extend effort parameter to other models, modify this check
+            or llm_config.model.startswith("claude-opus-4-5")
         )
 
     @trace_method
@@ -671,7 +769,7 @@ class AnthropicClient(LLMClientBase):
     # TODO: Input messages doesn't get used here
     # TODO: Clean up this interface
     @trace_method
-    def convert_response_to_chat_completion(
+    async def convert_response_to_chat_completion(
         self,
         response_data: dict,
         input_messages: List[PydanticMessage],
@@ -774,15 +872,34 @@ class AnthropicClient(LLMClientBase):
             ),
         )
 
+        # Build prompt tokens details with cache data if available
+        prompt_tokens_details = None
+        cache_read_tokens = 0
+        cache_creation_tokens = 0
+        if hasattr(response.usage, "cache_read_input_tokens") or hasattr(response.usage, "cache_creation_input_tokens"):
+            from letta.schemas.openai.chat_completion_response import UsageStatisticsPromptTokenDetails
+
+            cache_read_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_tokens = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens_details = UsageStatisticsPromptTokenDetails(
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+            )
+
+        # Per Anthropic docs: "Total input tokens in a request is the summation of
+        # input_tokens, cache_creation_input_tokens, and cache_read_input_tokens."
+        actual_input_tokens = prompt_tokens + cache_read_tokens + cache_creation_tokens
+
         chat_completion_response = ChatCompletionResponse(
             id=response.id,
             choices=[choice],
             created=get_utc_time_int(),
             model=response.model,
             usage=UsageStatistics(
-                prompt_tokens=prompt_tokens,
+                prompt_tokens=actual_input_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
+                total_tokens=actual_input_tokens + completion_tokens,
+                prompt_tokens_details=prompt_tokens_details,
             ),
         )
         if llm_config.put_inner_thoughts_in_kwargs:
@@ -793,7 +910,7 @@ class AnthropicClient(LLMClientBase):
         return chat_completion_response
 
     def _add_cache_control_to_system_message(self, system_content):
-        """Add cache control to system message content"""
+        """Add cache control to system message content."""
         if isinstance(system_content, str):
             # For string content, convert to list format with cache control
             return [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
@@ -807,6 +924,44 @@ class AnthropicClient(LLMClientBase):
             return cached_content
 
         return system_content
+
+    def _add_cache_control_to_messages(self, messages):
+        """
+        Add cache control to the final content block of the final message.
+
+        This enables incremental conversation caching per Anthropic docs:
+        "During each turn, we mark the final block of the final message with cache_control
+        so the conversation can be incrementally cached."
+
+        Args:
+            messages: List of Anthropic-formatted message dicts
+
+        Returns:
+            Modified messages list with cache_control on final block
+        """
+        if not messages or len(messages) == 0:
+            return messages
+
+        # Work backwards to find the last message with content
+        for i in range(len(messages) - 1, -1, -1):
+            message = messages[i]
+            content = message.get("content")
+
+            if not content:
+                continue
+
+            # Handle string content
+            if isinstance(content, str):
+                messages[i]["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                return messages
+
+            # Handle list content - add cache_control to the last block
+            if isinstance(content, list) and len(content) > 0:
+                # Add cache_control to the last content block
+                messages[i]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+                return messages
+
+        return messages
 
 
 def convert_tools_to_anthropic_format(tools: List[OpenAITool]) -> List[dict]:
@@ -937,10 +1092,14 @@ def is_heartbeat(message: dict, is_ping: bool = False) -> bool:
     except:
         return False
 
+    # Check if message_json is a dict (not int, str, list, etc.)
+    if not isinstance(message_json, dict):
+        return False
+
     if "reason" not in message_json:
         return False
 
-    if message_json["type"] != "heartbeat":
+    if message_json.get("type") != "heartbeat":
         return False
 
     if not is_ping:

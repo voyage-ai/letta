@@ -1,6 +1,6 @@
 [project]
 name = "letta"
-version = "0.14.0"
+version = "0.16.0"
 description = "Create LLM agents with long-term memory and custom tools"
 authors = [
     {name = "Letta Team", email = "contact@letta.com"},
@@ -42,9 +42,9 @@ dependencies = [
     "grpcio-tools>=1.68.1",
     "llama-index>=0.12.2",
     "llama-index-embeddings-openai>=0.3.1",
-    "anthropic>=0.49.0",
-    "letta-client>=0.1.319",
-    "openai>=1.99.9",
+    "anthropic>=0.75.0",
+    "letta-client>=1.3.1",
+    "openai>=2.11.0",
     "opentelemetry-api==1.30.0",
     "opentelemetry-sdk==1.30.0",
     "opentelemetry-instrumentation-requests==0.51b0",
@@ -69,9 +69,10 @@ dependencies = [
     "ruff[dev]>=0.12.10",
     "trafilatura",
     "readability-lxml",
-    "google-genai>=1.15.0",
     "voyageai>=0.3.5",
+    "google-genai>=1.52.0",
     "datadog>=0.49.1",
+    "psutil>=5.9.0",
 ]
 
 [project.scripts]
@@ -151,7 +152,6 @@ desktop = [
 ]
 profiling = [
     "ddtrace>=2.18.2",
-    "google-cloud-profiler>=4.1.0",
 ]
 
 [build-system]

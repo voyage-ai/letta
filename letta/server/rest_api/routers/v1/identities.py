@@ -25,7 +25,11 @@ router = APIRouter(prefix="/identities", tags=["identities"])
 @router.get("/", tags=["identities"], response_model=List[Identity], operation_id="list_identities")
 async def list_identities(
     name: Optional[str] = Query(None),
-    project_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(
+        None,
+        deprecated=True,
+        description="[DEPRECATED: Use X-Project-Id header instead] Filter identities by project ID",
+    ),
     identifier_key: Optional[str] = Query(None),
     identity_type: Optional[IdentityType] = Query(None),
     before: Optional[str] = Query(
@@ -126,8 +130,8 @@ async def modify_identity(
     return await server.identity_manager.update_identity_async(identity_id=identity_id, identity=identity, actor=actor)
 
 
-@router.put("/{identity_id}/properties", tags=["identities"], operation_id="upsert_identity_properties")
-async def upsert_identity_properties(
+@router.put("/{identity_id}/properties", tags=["identities"], operation_id="upsert_properties_for_identity")
+async def upsert_properties_for_identity(
     identity_id: IdentityId,
     properties: List[IdentityProperty] = Body(...),
     server: "SyncServer" = Depends(get_letta_server),

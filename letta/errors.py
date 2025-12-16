@@ -110,6 +110,18 @@ class LettaInvalidArgumentError(LettaError):
         super().__init__(message=message, code=ErrorCode.INVALID_ARGUMENT, details=details)
 
 
+class LettaImageFetchError(LettaError):
+    """Error raised when fetching an image from a URL fails."""
+
+    def __init__(self, url: str, reason: str):
+        details = {"url": url, "reason": reason}
+        super().__init__(
+            message=f"Failed to fetch image from {url}: {reason}",
+            code=ErrorCode.INVALID_ARGUMENT,
+            details=details,
+        )
+
+
 class LettaMCPError(LettaError):
     """Base error for MCP-related issues."""
 
@@ -253,6 +265,16 @@ class ContextWindowExceededError(LettaError):
         )
 
 
+class SystemPromptTokenExceededError(ContextWindowExceededError):
+    """Error raised when the system prompt token estimate exceeds the context window."""
+
+    def __init__(self, system_prompt_token_estimate: int, context_window: int):
+        message = f"The system prompt tokens {system_prompt_token_estimate} exceeds the context window {context_window}. Please reduce the size of your system prompt, memory blocks, or increase the context window."
+        super().__init__(
+            message=message, details={"system_prompt_token_estimate": system_prompt_token_estimate, "context_window": context_window}
+        )
+
+
 class RateLimitExceededError(LettaError):
     """Error raised when the llm rate limiter throttles api requests."""
 
@@ -355,3 +377,10 @@ class AgentExportProcessingError(AgentFileExportError):
 
 class AgentFileImportError(Exception):
     """Exception raised during agent file import operations"""
+
+
+class RunCancelError(LettaError):
+    """Error raised when a run cannot be cancelled."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message)
