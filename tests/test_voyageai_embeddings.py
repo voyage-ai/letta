@@ -27,10 +27,12 @@ class TestVoyageAIClientHelpers:
         assert is_contextual_model("voyage-context-3") is True
         assert is_contextual_model("voyage-3") is False
         assert is_contextual_model("voyage-multimodal-3") is False
+        assert is_contextual_model("voyage-multimodal-3.5") is False
 
     def test_is_multimodal_model(self):
         """Test multimodal model detection."""
         assert is_multimodal_model("voyage-multimodal-3") is True
+        assert is_multimodal_model("voyage-multimodal-3.5") is True
         assert is_multimodal_model("voyage-3") is False
         assert is_multimodal_model("voyage-context-3") is False
 
@@ -39,6 +41,8 @@ class TestVoyageAIClientHelpers:
         assert get_token_limit("voyage-context-3") == 32_000
         assert get_token_limit("voyage-3.5-lite") == 1_000_000
         assert get_token_limit("voyage-3") == 120_000
+        assert get_token_limit("voyage-multimodal-3") == 32_000
+        assert get_token_limit("voyage-multimodal-3.5") == 32_000
         assert get_token_limit("unknown-model") == 120_000  # default
 
 
@@ -69,18 +73,29 @@ class TestVoyageAIClientFunctions:
             batch_size=32,
         )
 
+    @pytest.fixture
+    def multimodal_embedding_config(self):
+        """Create a test multimodal embedding config."""
+        return EmbeddingConfig(
+            embedding_model="voyage-multimodal-3.5",
+            embedding_endpoint_type="voyageai",
+            embedding_endpoint="https://api.voyageai.com/v1",
+            embedding_dim=1024,
+            embedding_chunk_size=10,
+            batch_size=100,
+        )
+
     @pytest.mark.asyncio
     async def test_voyageai_get_embeddings_regular_model(self, embedding_config):
         """Test regular embeddings API call."""
-        with patch("letta.llm_api.voyageai_client.voyageai") as mock_voyageai:
+        with patch("voyageai.AsyncClient") as mock_client_class:
             # Mock client and response
             mock_client = AsyncMock()
-            mock_voyageai.AsyncClient.return_value = mock_client
+            mock_client_class.return_value = mock_client
 
             mock_result = Mock()
             mock_result.embeddings = [[0.1, 0.2], [0.3, 0.4]]
             mock_client.embed.return_value = mock_result
-            mock_client.close = AsyncMock()
 
             texts = ["text 1", "text 2"]
             embeddings = await voyageai_get_embeddings_async(
@@ -101,15 +116,14 @@ class TestVoyageAIClientFunctions:
     @pytest.mark.asyncio
     async def test_voyageai_get_embeddings_contextual_model(self, contextual_embedding_config):
         """Test contextual embeddings API call."""
-        with patch("letta.llm_api.voyageai_client.voyageai") as mock_voyageai:
+        with patch("voyageai.AsyncClient") as mock_client_class:
             # Mock client and response
             mock_client = AsyncMock()
-            mock_voyageai.AsyncClient.return_value = mock_client
+            mock_client_class.return_value = mock_client
 
             mock_result = Mock()
             mock_result.results = [Mock(embeddings=[[0.1, 0.2], [0.3, 0.4]])]
             mock_client.contextualized_embed.return_value = mock_result
-            mock_client.close = AsyncMock()
 
             texts = ["chunk 1", "chunk 2"]
             embeddings = await voyageai_get_embeddings_async(
@@ -129,15 +143,14 @@ class TestVoyageAIClientFunctions:
     @pytest.mark.asyncio
     async def test_voyageai_multimodal_get_embeddings(self, embedding_config):
         """Test multimodal embeddings API call."""
-        with patch("letta.llm_api.voyageai_client.voyageai") as mock_voyageai:
+        with patch("voyageai.AsyncClient") as mock_client_class:
             # Mock client and response
             mock_client = AsyncMock()
-            mock_voyageai.AsyncClient.return_value = mock_client
+            mock_client_class.return_value = mock_client
 
             mock_result = Mock()
             mock_result.embeddings = [[0.1, 0.2], [0.3, 0.4]]
             mock_client.multimodal_embed.return_value = mock_result
-            mock_client.close = AsyncMock()
 
             inputs = ["text input", {"image": "base64_data"}]
             embeddings = await voyageai_multimodal_get_embeddings_async(
@@ -154,16 +167,45 @@ class TestVoyageAIClientFunctions:
             assert call_kwargs["inputs"] == inputs
 
     @pytest.mark.asyncio
-    async def test_voyageai_count_tokens(self):
-        """Test token counting API call."""
-        with patch("letta.llm_api.voyageai_client.voyageai") as mock_voyageai:
+    async def test_voyageai_multimodal_get_embeddings_with_output_dimension(self, multimodal_embedding_config):
+        """Test multimodal embeddings API call with custom output dimension."""
+        with patch("voyageai.AsyncClient") as mock_client_class:
             # Mock client and response
             mock_client = AsyncMock()
-            mock_voyageai.AsyncClient.return_value = mock_client
+            mock_client_class.return_value = mock_client
 
-            # Mock tokenize returns list of token lists
+            # Return embeddings with custom dimension (512)
+            mock_result = Mock()
+            mock_result.embeddings = [[0.1] * 512, [0.2] * 512]
+            mock_client.multimodal_embed.return_value = mock_result
+
+            inputs = ["text input", {"content": [{"type": "image", "image_base64": "base64_data"}]}]
+            embeddings = await voyageai_multimodal_get_embeddings_async(
+                inputs=inputs,
+                embedding_config=multimodal_embedding_config,
+                api_key="test_key",
+                output_dimension=512,
+            )
+
+            assert len(embeddings) == 2
+            assert len(embeddings[0]) == 512
+            assert len(embeddings[1]) == 512
+
+            # Verify multimodal_embed was called with output_dimension
+            mock_client.multimodal_embed.assert_called_once()
+            call_kwargs = mock_client.multimodal_embed.call_args[1]
+            assert call_kwargs["output_dimension"] == 512
+
+    @pytest.mark.asyncio
+    async def test_voyageai_count_tokens(self):
+        """Test token counting API call."""
+        with patch("voyageai.AsyncClient") as mock_client_class:
+            # Mock client - use regular Mock since tokenize is synchronous
+            mock_client = Mock()
+            mock_client_class.return_value = mock_client
+
+            # Mock tokenize returns list of token lists (synchronous method)
             mock_client.tokenize.return_value = [[1, 2, 3], [4, 5, 6, 7], [8, 9]]
-            mock_client.close = AsyncMock()
 
             texts = ["short text", "longer text here", "ok"]
             token_counts = await voyageai_count_tokens_async(texts=texts, model="voyage-3", api_key="test_key")
@@ -392,7 +434,10 @@ class TestVoyageAIIntegration:
             batch_size=120,
         )
 
+        # VoyageAIEmbedder reads from model_settings which should have the API key
+        # since we're in the Integration test class that requires VOYAGEAI_API_KEY
         embedder = VoyageAIEmbedder(config)
+
         chunks = [
             "Machine learning is a subset of artificial intelligence.",
             "Neural networks are inspired by biological neural networks.",
@@ -406,8 +451,7 @@ class TestVoyageAIIntegration:
         assert len(passages) == 3
         for i, passage in enumerate(passages):
             assert passage.text == chunks[i]
-            assert len(passage.embedding) == 4096  # Letta pads to MAX_EMBEDDING_DIM
-            # Check first 1024 values are non-zero (actual embedding)
+            assert len(passage.embedding) == 1024  # Native model dimension (padding to 4096 only with Postgres)
             assert any(passage.embedding[j] != 0 for j in range(1024))
             assert passage.file_id == "test_file"
             assert passage.source_id == "test_source"
@@ -424,6 +468,7 @@ class TestVoyageAIIntegration:
             batch_size=1000,  # large batch size
         )
 
+        # VoyageAIEmbedder reads from model_settings which should have the API key
         embedder = VoyageAIEmbedder(config)
 
         # Create 50 chunks of varying lengths
@@ -435,5 +480,117 @@ class TestVoyageAIIntegration:
 
         assert len(passages) == 50
         for passage in passages:
-            assert len(passage.embedding) == 4096  # Letta pads to MAX_EMBEDDING_DIM
+            assert len(passage.embedding) == 1024  # Native model dimension (padding to 4096 only with Postgres)
             assert passage.file_id == "test_file"
+
+    @pytest.mark.asyncio
+    async def test_real_multimodal_embeddings_voyage_multimodal_3(self):
+        """Test real API call with voyage-multimodal-3 model (text only)."""
+        config = EmbeddingConfig(
+            embedding_model="voyage-multimodal-3",
+            embedding_endpoint_type="voyageai",
+            embedding_endpoint="https://api.voyageai.com/v1",
+            embedding_dim=1024,
+            embedding_chunk_size=10,
+            batch_size=100,
+        )
+
+        # Multimodal inputs must be list-of-lists format
+        inputs = [
+            ["A photo of a cat sitting on a couch."],
+            ["An image showing a mountain landscape at sunset."],
+        ]
+        embeddings = await voyageai_multimodal_get_embeddings_async(
+            inputs=inputs,
+            embedding_config=config,
+            api_key=model_settings.voyageai_api_key,
+        )
+
+        assert len(embeddings) == 2
+        assert len(embeddings[0]) == 1024
+        assert len(embeddings[1]) == 1024
+        assert all(isinstance(x, float) for x in embeddings[0])
+
+    @pytest.mark.asyncio
+    async def test_real_multimodal_embeddings_voyage_multimodal_3_5(self):
+        """Test real API call with voyage-multimodal-3.5 model (text only)."""
+        config = EmbeddingConfig(
+            embedding_model="voyage-multimodal-3.5",
+            embedding_endpoint_type="voyageai",
+            embedding_endpoint="https://api.voyageai.com/v1",
+            embedding_dim=1024,
+            embedding_chunk_size=10,
+            batch_size=100,
+        )
+
+        # Multimodal inputs must be list-of-lists format
+        inputs = [
+            ["A photo of a cat sitting on a couch."],
+            ["An image showing a mountain landscape at sunset."],
+        ]
+        embeddings = await voyageai_multimodal_get_embeddings_async(
+            inputs=inputs,
+            embedding_config=config,
+            api_key=model_settings.voyageai_api_key,
+        )
+
+        assert len(embeddings) == 2
+        assert len(embeddings[0]) == 1024
+        assert len(embeddings[1]) == 1024
+        assert all(isinstance(x, float) for x in embeddings[0])
+
+    @pytest.mark.asyncio
+    async def test_real_multimodal_embeddings_flexible_output_dimension(self):
+        """Test voyage-multimodal-3.5 with flexible output dimensions (256, 512, 1024, 2048)."""
+        config = EmbeddingConfig(
+            embedding_model="voyage-multimodal-3.5",
+            embedding_endpoint_type="voyageai",
+            embedding_endpoint="https://api.voyageai.com/v1",
+            embedding_dim=1024,  # Default, but we'll override with output_dimension
+            embedding_chunk_size=10,
+            batch_size=100,
+        )
+
+        # Multimodal inputs must be list-of-lists format
+        inputs = [["A test sentence for dimension testing."]]
+
+        # Test different output dimensions supported by voyage-multimodal-3.5
+        for dim in [256, 512, 1024, 2048]:
+            embeddings = await voyageai_multimodal_get_embeddings_async(
+                inputs=inputs,
+                embedding_config=config,
+                api_key=model_settings.voyageai_api_key,
+                output_dimension=dim,
+            )
+
+            assert len(embeddings) == 1
+            assert len(embeddings[0]) == dim, f"Expected dimension {dim}, got {len(embeddings[0])}"
+            assert all(isinstance(x, float) for x in embeddings[0])
+
+    @pytest.mark.asyncio
+    async def test_real_multimodal_3_5_token_limit(self):
+        """Test that voyage-multimodal-3.5 respects its 32k token limit."""
+        # Verify token limit is configured correctly
+        assert get_token_limit("voyage-multimodal-3.5") == 32_000
+        assert get_token_limit("voyage-multimodal-3") == 32_000
+
+        config = EmbeddingConfig(
+            embedding_model="voyage-multimodal-3.5",
+            embedding_endpoint_type="voyageai",
+            embedding_endpoint="https://api.voyageai.com/v1",
+            embedding_dim=1024,
+            embedding_chunk_size=10,
+            batch_size=100,
+        )
+
+        # Multimodal inputs must be list-of-lists format
+        inputs = [[f"Test input number {i} for batching verification."] for i in range(10)]
+        embeddings = await voyageai_multimodal_get_embeddings_async(
+            inputs=inputs,
+            embedding_config=config,
+            api_key=model_settings.voyageai_api_key,
+        )
+
+        assert len(embeddings) == 10
+        for emb in embeddings:
+            assert len(emb) == 1024

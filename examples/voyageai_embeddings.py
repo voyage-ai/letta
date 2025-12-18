@@ -6,7 +6,7 @@ VoyageAI provides three types of embedding models:
 
 1. **Text embeddings**: Standard models for general text (voyage-3.5, voyage-3.5-lite, voyage-code-3, etc.)
 2. **Contextual embeddings**: Models that understand document context (voyage-context-3)
-3. **Multimodal embeddings**: Models that handle text and images (voyage-multimodal-3)
+3. **Multimodal embeddings**: Models that handle text+images (voyage-multimodal-3) or text+images+video (voyage-multimodal-3.5)
 
 Prerequisites:
 - Run the Letta server: `letta server`
@@ -248,7 +248,8 @@ General Purpose:
 
 Specialized Models:
   • voyage-context-3    - Contextual embeddings for documents (1024-dim)
-  • voyage-multimodal-3 - Text + image support (1024-dim)
+  • voyage-multimodal-3   - Text + image support (1024-dim)
+  • voyage-multimodal-3.5 - Text + image + video support (1024-dim, preview)
   • voyage-code-3       - Optimized for code (1024-dim)
   • voyage-finance-2    - Financial domain (1024-dim)
   • voyage-law-2        - Legal domain (1024-dim)

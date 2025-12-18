@@ -52,6 +52,7 @@ class VoyageAIProvider(Provider):
             ("voyage-context-3", 1024),
             # Multimodal embedding models
             ("voyage-multimodal-3", 1024),
+            ("voyage-multimodal-3.5", 1024),
         ]
         return [
             EmbeddingConfig(
